@@ -5,6 +5,9 @@ on its own (tests/test_mako.py).
     version = 2
     [global]            allow_fp16, dll (optional)
     [[profile]]         name, active_in = ["<steam appid>", "Game.exe", …], multiplier, …
+    [profile.handheld]  optional (MAKO 4.5+, set in mako-ui), with [profile.docked]: the
+    [profile.docked]    profile's options on battery and on AC. Pescao edits one general
+                        set of options, so it only offers to remove these (unify).
 
 MAKO applies the profile whose `active_in` contains the game's Steam app id (as a
 string) or its executable/process name (MAKO_PROFILE, set at launch, wins over that).
@@ -105,6 +108,21 @@ def delete(data, name):
     data["profile"] = [p for p in data.get("profile", []) if p.get("name") != name]
 
 
+POWER_MODES = ("handheld", "docked")
+
+
+def has_power_modes(profile):
+    """The profile has separate battery/AC options: MAKO uses those instead of its
+    general ones whenever it knows the power source (always, on a Steam Deck)."""
+    return any(isinstance(profile.get(m), dict) for m in POWER_MODES)
+
+
+def unify(profile):
+    """One set of options for battery and AC: the general ones (the profile's own keys)."""
+    for m in POWER_MODES:
+        profile.pop(m, None)
+
+
 # Profile keys mako-ui writes in every new profile that aren't options here ("none" is
 # the only pacing MAKO supports).
 FIXED = {"pacing": "none"}
@@ -128,7 +146,7 @@ DEFAULT_FLOW_SCALE = 0.8
 
 
 def change(data, profile, key, value):
-    """Set one profile option with the side effects mako-ui (MAKO 4.0) applies, so a
+    """Set one profile option with the side effects mako-ui (MAKO 4.6) applies, so a
     profile edited here ends up as mako-ui would leave it. ValueError if the option is
     locked by another one. Returns the keys changed besides `key`."""
     also = {}
@@ -137,18 +155,19 @@ def change(data, profile, key, value):
     if key == "scaling_method" and profile.get("ultra_performance") and profile.get("scaling_enabled"):
         raise ValueError("the scaling method is set by Ultra performance: turn that off first")
     if key == "ultra_performance":
+        # FP16 stays the global choice (allow_fp16): since MAKO 4.5 the preset doesn't touch it.
         also = {"flow_scale": ULTRA_FLOW_SCALE if value else DEFAULT_FLOW_SCALE, "performance_mode": bool(value)}
-        data.setdefault("global", {})["allow_fp16"] = True  # mako-ui turns FP16 on either way
     elif key == "dynamic_cadence_recovery" and value:
         # Recovery rechecks the native cadence: real-frame caps would fight it.
-        also = {"adaptive_auto_base_fps_cap": False, "adaptive_fractional_real_frame_priority": "auto", "base_fps_cap": 0}
+        also = {"adaptive_auto_base_fps_cap": False, "adaptive_fractional_real_frame_priority": "auto", "base_fps_cap": 0,
+                "gpu_headroom_percent": 0}
     elif (key == "base_fps_cap" and value > 0) or (key == "adaptive_auto_base_fps_cap" and value) \
-            or key == "adaptive_fractional_real_frame_priority":
+            or (key == "gpu_headroom_percent" and value > 0) or key == "adaptive_fractional_real_frame_priority":
         also = {"dynamic_cadence_recovery": False}
     set_value(profile, key, value)
     for k, v in also.items():
         profile[k] = v
-    return sorted([*also, *(["allow_fp16"] if key == "ultra_performance" else [])])
+    return sorted(also)
 
 
 def set_global(data, key, value):

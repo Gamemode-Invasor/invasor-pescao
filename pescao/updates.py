@@ -64,7 +64,7 @@ EMBEDDED = re.compile(rb"(?<![\w.-])(\d{1,3}\.\d{1,3}\.\d{1,3}(?:-[0-9A-Za-z.]{1
 
 # The MAKO series this Pescao was written and tested against. Same major, newer minor:
 # usable (new options just don't show here). Another major: never installed by Pescao.
-TESTED = (4, 0)
+TESTED = (4, 6)
 SUPPORTED_MAJOR = 4
 
 

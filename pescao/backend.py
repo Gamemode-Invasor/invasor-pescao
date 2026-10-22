@@ -122,7 +122,8 @@ def status():
 
 
 def profiles():
-    """[{name, games: [{entry, name}]}]: every profile and the games that use it."""
+    """[{name, games: [{entry, name}], power_modes}]: every profile, the games that use it,
+    and whether it has separate battery/AC options (mako.has_power_modes)."""
     _, data, _ = _read()
     out = []
     for p in data.get("profile", []):
@@ -132,7 +133,7 @@ def profiles():
             if isinstance(entry, str) and entry.isascii() and entry.isdigit():
                 label = (ctx.game.info(entry) or {}).get("name")
             games.append({"entry": entry, "name": label})
-        out.append({"name": p.get("name"), "games": games})
+        out.append({"name": p.get("name"), "games": games, "power_modes": mako.has_power_modes(p)})
     return out
 
 
@@ -163,6 +164,12 @@ def profile_rename(old, new):
 
 def profile_delete(name):
     _change(lambda data: (mako.find(data, name), mako.delete(data, name)))
+    return True
+
+
+def profile_unify(name):
+    """Drop the profile's separate battery/AC options: MAKO then uses its general ones."""
+    _change(lambda data: mako.unify(mako.find(data, name)))
     return True
 
 
@@ -226,17 +233,30 @@ def _quote(value):
 
 # ---------- mako-launch's own settings ----------
 
-def launcher_get():
+# Shown as "HDR" (on/off), as mako-ui does; launcher.conf keeps it the other way round.
+HDR = "enable_hdr"
+
+
+def _launcher_load():
     try:
         return launcher.load()
     except launcher.Invalid as e:
         raise ctx.Unavailable(f"{launcher.path()} isn't valid ({e}): mako-launch ignores it; fix or remove it") from None
 
 
+def launcher_get():
+    settings = _launcher_load()
+    settings[HDR] = not settings.pop("disable_hdr_exposure")
+    return settings
+
+
 def launcher_set(key, value):
     value = ctx.forms["launcher"].coerce(key, value)
-    settings = launcher_get()
-    settings[key] = value
+    settings = _launcher_load()
+    if key == HDR:
+        settings["disable_hdr_exposure"] = not value
+    else:
+        settings[key] = value
     try:
         launcher.save(settings)
     except OSError as e:
@@ -246,7 +266,7 @@ def launcher_set(key, value):
 
 def launch_option(name=None):
     """{line, found}: the launch option for a profile, as mako-ui builds it, and whether
-    mako-launch is installed. MAKO_PROFILE is what makes MAKO use the profile: MAKO 4.0
+    mako-launch is installed. MAKO_PROFILE is what makes MAKO use the profile: MAKO 4
     matches active_in against executables and process names, not Steam ids."""
     parts = []
     if name is not None:
@@ -322,6 +342,7 @@ METHODS = {
     "profile_create": profile_create,
     "profile_rename": profile_rename,
     "profile_delete": profile_delete,
+    "profile_unify": profile_unify,
     "global_get": global_get,
     "global_set": global_set,
     "game_profile": game_profile,

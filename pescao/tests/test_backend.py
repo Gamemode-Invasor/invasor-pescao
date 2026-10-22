@@ -127,9 +127,11 @@ class Backend(unittest.TestCase):
         self.assertEqual(self.b.make_custom("1000")["profile"], "Test Game")  # already its own: kept
 
     def test_options_that_change_others(self):
+        self.b.global_set("allow_fp16", False)
         self.b.profile_set("default", "ultra_performance", True)
         p = self.file()["profile"][0]
-        self.assertEqual((p["flow_scale"], p["performance_mode"], self.file()["global"]["allow_fp16"]), (0.7, True, True))
+        # Since MAKO 4.5 FP16 is only the global choice: Ultra leaves it alone.
+        self.assertEqual((p["flow_scale"], p["performance_mode"], self.file()["global"]["allow_fp16"]), (0.7, True, False))
         with self.assertRaisesRegex(schema.InvalidArgument, "Ultra performance"):
             self.b.profile_set("default", "flow_scale", 0.9)
         self.assertEqual(self.b.profile_get("default")["flow_scale"], 0.7)
@@ -160,13 +162,14 @@ class Backend(unittest.TestCase):
             self.b.profiles()
 
     def test_new_profiles_match_mako_ui(self):
-        # A profile as mako-ui creates it (MAKO 4.0.0), keys in its order.
+        # A profile as mako-ui creates it (MAKO 4.6.0), keys in its order.
         mako_ui = tomllib.loads("""[[profile]]
 adaptive = false
 adaptive_auto_base_fps_cap = false
 adaptive_fractional_real_frame_priority = "auto"
 adaptive_max_multiplier = 3
 adaptive_stable_cadence = true
+adaptive_target_refresh_rate = false
 base_fps_cap = 0
 dynamic_cadence_probe_interval_seconds = 2.0
 dynamic_cadence_recovery = false
@@ -175,6 +178,8 @@ frame_generation_enabled = true
 frame_generation_provisioned = true
 frame_generation_refresh_threshold = 0
 gamescope_vrr_mode = "follow-steam"
+gpu_headroom_percent = 0
+hdr_quality = "performance"
 multiplier = 2
 name = "nuevo"
 pacing = "none"
@@ -226,7 +231,7 @@ ultra_performance = false
     def test_a_new_major_version_is_never_installed(self):
         u = self.b.updates
         u.fetch_latest = lambda opener=None: {"version": "5.0.0", "url": "x"}
-        u.installed = lambda: {"version": "4.0.0", "path": "/x", "local": True, "owner": "standalone"}
+        u.installed = lambda: {"version": "4.6.0", "path": "/x", "local": True, "owner": "standalone"}
         u.download = lambda *a, **k: self.fail("must not download")
         st = self.b.update_status()
         self.assertEqual((st["state"], st["latest_compat"], st["installed_compat"]), ("newer_available", "unsupported", "tested"))
@@ -241,6 +246,19 @@ ultra_performance = false
         with self.assertRaises(schema.InvalidArgument):
             self.b.launch_option("ghost")
 
+    def test_battery_and_ac_settings_become_one(self):
+        data = self.file()
+        data["profile"][0]["handheld"] = {"multiplier": 3}
+        data["profile"][0]["docked"] = {"multiplier": 4}
+        self.path.write_text(tomlio.dumps(data))
+        self.assertTrue(self.b.profiles()[0]["power_modes"])
+        self.assertTrue(self.b.profile_unify("default"))
+        self.assertFalse(self.b.profiles()[0]["power_modes"])
+        self.assertNotIn("handheld", self.file()["profile"][0])
+        self.assertNotIn("docked", self.file()["profile"][0])
+        with self.assertRaises(schema.InvalidArgument):
+            self.b.profile_unify("ghost")
+
     def test_rename_and_delete_touch_only_conf_toml(self):
         before = sorted(p.name for p in self.path.parent.iterdir())
         self.b.profile_rename("default", "renamed")
@@ -253,9 +271,13 @@ ultra_performance = false
         import os
         os.environ["MAKO_LAUNCH_CONFIG"] = str(self.path.parent / "launcher.conf")
         self.addCleanup(os.environ.pop, "MAKO_LAUNCH_CONFIG")
-        self.assertEqual(self.b.launcher_get(), {"enable_zink": False, "force_alsa_audio": False})
+        self.assertEqual(self.b.launcher_get(), {"disable_steam_overlay": True, "enable_hdr": False, "enable_zink": False, "force_alsa_audio": False})
         self.assertTrue(self.b.launcher_set("enable_zink", True))
-        self.assertEqual((self.path.parent / "launcher.conf").read_text(), "version=1\nenable_zink=1\nforce_alsa_audio=0\n")
+        self.assertTrue(self.b.launcher_set("enable_hdr", True))  # kept as disable_hdr_exposure, as mako-ui does
+        self.assertFalse(self.b.launcher_set("disable_steam_overlay", False))
+        self.assertEqual((self.path.parent / "launcher.conf").read_text(),
+                         "version=1\ndisable_hdr_exposure=0\ndisable_steam_overlay=0\nenable_zink=1\nforce_alsa_audio=0\n")
+        self.assertEqual(self.b.launcher_get(), {"disable_steam_overlay": False, "enable_hdr": True, "enable_zink": True, "force_alsa_audio": False})
         (self.path.parent / "launcher.conf").write_text("version=9\n")
         with self.assertRaises(schema.Unavailable):
             self.b.launcher_set("enable_zink", False)

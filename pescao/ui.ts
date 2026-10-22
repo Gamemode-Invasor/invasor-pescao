@@ -19,12 +19,14 @@ interface Status {
 interface ProfileInfo {
   name: string;
   games: { entry: string; name: string | null }[];
+  /** Separate battery/AC options (made in mako-ui): MAKO uses those, not the ones shown here. */
+  power_modes: boolean;
 }
 
 const errorText = (e: unknown) => String((e as Error)?.message ?? e);
 
 // Forms on screen. Some options change others, as in mako-ui (e.g. Ultra performance sets
-// flow scale, the lighter model and FP16; keep in sync with mako.change): after saving one
+// flow scale and the lighter model; keep in sync with mako.change): after saving one
 // of those, every form shows what's stored. Other saves don't reload (a held slider would jump).
 const forms = new Set<SettingsForm>();
 const CHANGES_OTHERS = new Set([
@@ -33,6 +35,7 @@ const CHANGES_OTHERS = new Set([
   "base_fps_cap",
   "adaptive_auto_base_fps_cap",
   "adaptive_fractional_real_frame_priority",
+  "gpu_headroom_percent",
 ]);
 
 function refreshForms() {
@@ -61,7 +64,7 @@ async function form(ctx: ModuleCtx, name: string, st: FormStore): Promise<Settin
   return f;
 }
 
-const TESTED = "4.0"; // keep in sync with updates.TESTED
+const TESTED = "4.6"; // keep in sync with updates.TESTED
 
 /** MAKO's shaders (its bundled vkBasalt) are left out of Pescao for now. */
 const SHADERS_NOTE = "Shaders (MAKO's vkBasalt effects) aren't set up by Pescao for now: use mako-ui for them, and add the variables it shows to the launch option.";
@@ -90,7 +93,7 @@ async function copyText(text: string): Promise<boolean> {
 
 /**
  * The launch option for a profile (as mako-ui builds it) with a Copy button. MAKO uses the
- * profile named by MAKO_PROFILE in it: MAKO 4.0 doesn't match games by their Steam id.
+ * profile named by MAKO_PROFILE in it: MAKO 4 doesn't match games by their Steam id.
  */
 async function launchOption(ctx: ModuleCtx, name: string): Promise<HTMLElement[]> {
   let opt: { line: string; found: boolean };
@@ -112,6 +115,31 @@ async function launchOption(ctx: ModuleCtx, name: string): Promise<HTMLElement[]
   ];
   if (!opt.found) items.push(ui.info("⚠ mako-launch isn't there: install MAKO Renderer (Updates tab)."));
   return items;
+}
+
+/**
+ * For a profile with separate battery/AC options: Pescao edits one general set, which MAKO
+ * ignores while those exist. A button drops them (after asking); `done` redraws.
+ */
+function powerModesNote(ctx: ModuleCtx, profile: ProfileInfo | undefined, done: () => void): HTMLElement[] {
+  if (!profile?.power_modes) return [];
+  const name = profile.name;
+  return [
+    ui.info(`⚠ “${name}” has separate battery and AC settings (made in mako-ui). MAKO uses those, not the options here, until it has one setting for both.`),
+    ui.button({
+      label: "Use one setting for both",
+      onClick: async () => {
+        if (!(await ui.confirm(`Remove the separate battery and AC settings of “${name}”? It will use the options shown here, on battery and on AC.`, { ok: "Remove" }))) return;
+        try {
+          await ctx.call("profile_unify", { name });
+          ctx.toast(`“${name}”: one setting for battery and AC`);
+        } catch (e) {
+          ctx.toast(errorText(e), "error");
+        }
+        done();
+      },
+    }),
+  ];
 }
 
 /** A note when the installed MAKO isn't the series Pescao was tested with. */
@@ -149,7 +177,7 @@ async function renderGame(ctx: ModuleCtx, force = false) {
   } catch (e) {
     problem = errorText(e);
   }
-  const sig = JSON.stringify([t?.game.appid, t?.how, status, profiles.map((p) => p.name), current, problem]);
+  const sig = JSON.stringify([t?.game.appid, t?.how, status, profiles.map((p) => [p.name, p.power_modes]), current, problem]);
   if (!force && sig === gameSig) return; // nothing changed: keep the ring where it is
   gameSig = sig;
 
@@ -192,6 +220,7 @@ async function renderGame(ctx: ModuleCtx, force = false) {
       // Right under the switch, only while it's on: what the game needs to use MAKO.
       if (cur.profile) parts.push(...(await launchOption(ctx, cur.profile)));
       if (cur.profile && cur.custom) {
+        parts.push(...powerModesNote(ctx, profiles.find((p) => p.name === cur.profile), () => void renderGame(ctx, true)));
         parts.push(await form(ctx, "profile", store(ctx, "profile_get", "profile_set", { name: cur.profile })), ui.info(`ⓘ ${SHADERS_NOTE}`));
       } else if (cur.profile) {
         // Set up elsewhere (e.g. mako-ui) with a profile other games use too.
@@ -265,6 +294,7 @@ async function renderProfiles(ctx: ModuleCtx, pick?: string) {
     const profile = list.find((p) => p.name === name)!;
     parts.push(
       ui.select({ label: "Profile", value: name, options: names.map((n) => ({ value: n, label: n })), onChange: (v) => void renderProfiles(ctx, v) }),
+      ...powerModesNote(ctx, profile, () => void renderProfiles(ctx, name)),
       await form(ctx, "profile", store(ctx, "profile_get", "profile_set", { name })),
       ui.info(`ⓘ ${SHADERS_NOTE}`),
       ui.section("Launch option", await launchOption(ctx, name), { open: false }),
