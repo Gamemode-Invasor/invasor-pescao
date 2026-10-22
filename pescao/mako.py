@@ -15,7 +15,7 @@ A game should be in one profile at most. The same format as lsfg-vk 2, which MAK
 comes from; mako-ui's own side files (profile-metadata.json…) aren't touched.
 """
 import os
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 
 VERSION = 2
 LAYER_FILE = "VkLayer_MAKO_render.json"
