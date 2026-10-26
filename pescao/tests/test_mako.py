@@ -64,7 +64,7 @@ class Profiles(unittest.TestCase):
 class PerGame(unittest.TestCase):
     def test_entries_are_numeric_ids_for_steam_and_shortcuts(self):
         self.assertEqual(mako.game_entry("1245620"), "1245620")
-        self.assertEqual(mako.game_entry(3000000001, True), "3000000001")
+        self.assertEqual(mako.game_entry(3000000001), "3000000001")
         for bad in ("../1", "", "Game.exe", "12a"):
             with self.subTest(appid=bad), self.assertRaises(ValueError):
                 mako.game_entry(bad)
@@ -150,7 +150,7 @@ class OffAndOn(unittest.TestCase):
 
 
 class MakoUiRules(unittest.TestCase):
-    """The side effects mako-ui (MAKO 4.0) applies when an option changes."""
+    """The side effects mako-ui (MAKO 4.6) applies when an option changes."""
 
     def profile(self, **kw):
         data = {"version": 2, "global": {"allow_fp16": False}, "profile": [{"name": "p", "flow_scale": 0.5, "performance_mode": False, **kw}]}
@@ -158,8 +158,8 @@ class MakoUiRules(unittest.TestCase):
 
     def test_ultra_performance_is_a_locking_preset(self):
         data, p = self.profile(scaling_enabled=True)
-        self.assertEqual(mako.change(data, p, "ultra_performance", True), ["allow_fp16", "flow_scale", "performance_mode"])
-        self.assertEqual((p["flow_scale"], p["performance_mode"], data["global"]["allow_fp16"]), (0.7, True, True))
+        self.assertEqual(mako.change(data, p, "ultra_performance", True), ["flow_scale", "performance_mode"])
+        self.assertEqual((p["flow_scale"], p["performance_mode"], data["global"]["allow_fp16"]), (0.7, True, False))
         for key, value in (("flow_scale", 0.9), ("performance_mode", False), ("scaling_method", "mako")):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "Ultra performance"):
                 mako.change(data, p, key, value)
@@ -174,17 +174,30 @@ class MakoUiRules(unittest.TestCase):
         self.assertEqual(p["scaling_method"], "mako")
 
     def test_cadence_recovery_and_real_frame_caps_exclude_each_other(self):
-        data, p = self.profile(adaptive_auto_base_fps_cap=True, adaptive_fractional_real_frame_priority="high", base_fps_cap=60)
+        data, p = self.profile(adaptive_auto_base_fps_cap=True, adaptive_fractional_real_frame_priority="high", base_fps_cap=60,
+                               gpu_headroom_percent=10)
         mako.change(data, p, "dynamic_cadence_recovery", True)
-        self.assertEqual((p["adaptive_auto_base_fps_cap"], p["adaptive_fractional_real_frame_priority"], p["base_fps_cap"]), (False, "auto", 0))
-        for key, value in (("base_fps_cap", 30), ("adaptive_auto_base_fps_cap", True), ("adaptive_fractional_real_frame_priority", "low")):
+        self.assertEqual((p["adaptive_auto_base_fps_cap"], p["adaptive_fractional_real_frame_priority"], p["base_fps_cap"],
+                          p["gpu_headroom_percent"]), (False, "auto", 0, 0))
+        for key, value in (("base_fps_cap", 30), ("adaptive_auto_base_fps_cap", True), ("adaptive_fractional_real_frame_priority", "low"),
+                           ("gpu_headroom_percent", 15)):
             p["dynamic_cadence_recovery"] = True
             with self.subTest(key=key):
                 mako.change(data, p, key, value)
                 self.assertFalse(p["dynamic_cadence_recovery"])
         p["dynamic_cadence_recovery"] = True
         mako.change(data, p, "base_fps_cap", 0)  # removing a cap doesn't
+        mako.change(data, p, "gpu_headroom_percent", 0)
         self.assertTrue(p["dynamic_cadence_recovery"])
+
+    def test_one_setting_for_battery_and_ac(self):
+        data, p = self.profile(multiplier=2, handheld={"multiplier": 3}, docked={"multiplier": 4})
+        self.assertTrue(mako.has_power_modes(p))
+        mako.unify(p)
+        self.assertFalse(mako.has_power_modes(p))
+        self.assertEqual(p, {"name": "p", "flow_scale": 0.5, "performance_mode": False, "multiplier": 2})
+        mako.unify(p)  # nothing to remove: no change
+        self.assertEqual(p["multiplier"], 2)
 
 
 if __name__ == "__main__":

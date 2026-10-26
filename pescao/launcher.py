@@ -1,18 +1,22 @@
 """mako-launch's own settings (launcher.conf), in its strict format.
 
 Pure stdlib, no Invasor imports: tested on its own (tests/test_launcher.py). Ported from
-MAKO render-v4.0.0 engine/mako-common/src/configuration/launch.cpp. These apply to every
+MAKO render-v4.6.0 engine/mako-common/src/configuration/launch.cpp. These apply to every
 game started through mako-launch, at its next start; they never go in conf.toml.
 
     version=1
-    enable_zink=0|1
-    force_alsa_audio=0|1
+    disable_hdr_exposure=0|1     (missing: 1)
+    disable_steam_overlay=0|1    (missing: 1)
+    enable_zink=0|1              (missing: 0)
+    force_alsa_audio=0|1         (missing: 0)
 """
 import os
 import tempfile
 from pathlib import Path
 
-KEYS = ("enable_zink", "force_alsa_audio")
+# In the order mako-launch writes them, with its values for a missing key.
+DEFAULTS = {"disable_hdr_exposure": True, "disable_steam_overlay": True, "enable_zink": False, "force_alsa_audio": False}
+KEYS = tuple(DEFAULTS)
 
 
 class Invalid(ValueError):
@@ -29,8 +33,8 @@ def path(env=None):
 
 
 def parse(text):
-    """{enable_zink, force_alsa_audio} from launcher.conf's text; Invalid as mako-launch would."""
-    out = {k: False for k in KEYS}
+    """The settings (KEYS) from launcher.conf's text; Invalid as mako-launch would."""
+    out = dict(DEFAULTS)
     seen = set()
     for line in text.split("\n"):
         content = line.strip(" \t\r\n")
@@ -65,7 +69,7 @@ def load(p=None):
     try:
         return parse(Path(p or path()).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {k: False for k in KEYS}
+        return dict(DEFAULTS)
 
 
 def save(settings, p=None):

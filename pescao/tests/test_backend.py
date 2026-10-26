@@ -1,6 +1,5 @@
 import importlib.util
 import json
-import os
 import logging
 import sys
 import tempfile
@@ -8,16 +7,10 @@ import tomllib
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parents[1]
-# Invasor's core (ctx.toml, forms): $INVASOR_CORE (set by tools/check_module.py), else the
-# core this module sits in (modules/<id>), else a checkout next to this repository
-# (<repo>/<id>/ -> ../invasor).
-_core = os.environ.get("INVASOR_CORE") or next(
-    (str(p) for p in (HERE.parents[1], HERE.parents[1] / "invasor") if (p / "backend/invasor").is_dir()), "")
-sys.path.insert(0, str(Path(_core) / "backend"))
+from invasor import schema, tomlio
+from invasor.modules import Form
 
-from invasor import schema, tomlio  # noqa: E402
-from invasor.modules import Form  # noqa: E402
+from . import HERE
 
 # The shape of a real MAKO v2 config (made-up values).
 CONF = """version = 2
@@ -58,6 +51,63 @@ class FakeGame:
         return {"3000000001": '/games/Thing/Thing.exe'}.get(str(appid))
 
 
+class FakeTask:
+    def __init__(self, label):
+        self.label, self.texts = label, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def update(self, fraction, text=""):
+        self.texts.append(text)
+
+
+class FakeHttp:
+    """ctx.http: get_json answers `releases`; download writes b"tarball" at dest, or raises `deny`."""
+
+    def __init__(self):
+        self.releases, self.calls, self.deny = [], [], None
+
+    def get_json(self, url, *, max_bytes):
+        return self.releases
+
+    def download(self, url, dest, *, checksum=None, task=None):
+        self.calls.append((url, Path(dest).name, checksum, task))
+        if self.deny:
+            raise self.deny
+        Path(dest).write_bytes(b"tarball")
+        return {"path": str(dest)}
+
+
+class FakeSteam:
+    """ctx.steam's launch options, for one Steam that may lack set_launch_options."""
+
+    def __init__(self):
+        self.can, self.lines, self.verified = True, {}, True
+
+    def supports(self, name):
+        return self.can
+
+    def launch_options(self, appid):
+        return self.lines.get(str(appid), "")
+
+    def set_launch_options(self, appid, line):
+        self.lines[str(appid)] = line
+        return {"applied": True, "verified": self.verified}
+
+
+def github(version, sha256="ab" * 32):
+    """GitHub's release list with one Renderer release."""
+    name = f"MAKO-Renderer-v{version}-linux.tar.xz"
+    asset = {"name": name, "browser_download_url": f"https://github.com/eugeniosegala/MAKO/releases/download/render-v{version}/{name}"}
+    if sha256:
+        asset["digest"] = f"sha256:{sha256}"
+    return [{"tag_name": f"render-v{version}", "draft": False, "prerelease": False, "assets": [asset]}]
+
+
 class FakeCtx:
     InvalidArgument = schema.InvalidArgument
     Unavailable = schema.Unavailable
@@ -68,6 +118,14 @@ class FakeCtx:
         self.forms = {n: Form(f) for n, f in manifest["form_fields"].items()}
         self.game = FakeGame()
         self.log = logging.getLogger("test.pescao")
+        self.http = FakeHttp()
+        self.archive = type("Archive", (), {"extract": staticmethod(lambda *a, **k: [])})()
+        self.steam = FakeSteam()
+        self.tasks = []
+
+    def task(self, label):
+        self.tasks.append(FakeTask(label))
+        return self.tasks[-1]
 
 
 class Backend(unittest.TestCase):
@@ -80,7 +138,9 @@ class Backend(unittest.TestCase):
         self.b = load_backend()
         self.b.mako.config_path = lambda env=None: self.path
         self.b._cli = lambda: None  # tests never ask the real mako-cli unless they say so
-        self.b.setup(FakeCtx())
+        self.ctx = FakeCtx()
+        self.b.setup(self.ctx)
+        self.b.updates.PREFIX = Path(d.name) / ".local"
 
     def file(self):
         return tomllib.loads(self.path.read_text())
@@ -105,18 +165,18 @@ class Backend(unittest.TestCase):
     def test_per_game_profile(self):
         self.b.profile_create("3x")
         self.assertEqual(self.b.game_profile("1000"), {"entry": "1000", "profile": "default", "custom": True})
-        self.b.set_game_profile("1000", False, "3x")
-        self.b.set_game_profile("3000000001", True, "3x")
+        self.b.set_game_profile("1000", "3x")
+        self.b.set_game_profile("3000000001", "3x")
         self.assertEqual(self.file()["profile"][1]["active_in"], ["1000", "3000000001"])
         self.assertNotIn("active_in", self.file()["profile"][0])
         self.assertEqual(self.b.profiles()[1]["games"], [{"entry": "1000", "name": "Test Game"}, {"entry": "3000000001", "name": None}])
-        self.b.set_game_profile("1000", False, None)
+        self.b.set_game_profile("1000", None)
         self.assertIsNone(self.b.game_profile("1000")["profile"])
         with self.assertRaises(schema.InvalidArgument):
-            self.b.set_game_profile("1000", False, "ghost")
+            self.b.set_game_profile("1000", "ghost")
 
     def test_custom_profile_for_a_game(self):
-        self.b.set_game_profile("2000", False, "default")  # "default" is now shared by two games
+        self.b.set_game_profile("2000", "default")  # "default" is now shared by two games
         self.assertFalse(self.b.game_profile("1000")["custom"])
         made = self.b.make_custom("1000")  # title from the game's name
         self.assertEqual(made, {"entry": "1000", "profile": "Test Game", "custom": True})
@@ -127,9 +187,11 @@ class Backend(unittest.TestCase):
         self.assertEqual(self.b.make_custom("1000")["profile"], "Test Game")  # already its own: kept
 
     def test_options_that_change_others(self):
+        self.b.global_set("allow_fp16", False)
         self.b.profile_set("default", "ultra_performance", True)
         p = self.file()["profile"][0]
-        self.assertEqual((p["flow_scale"], p["performance_mode"], self.file()["global"]["allow_fp16"]), (0.7, True, True))
+        # Since MAKO 4.5 FP16 is only the global choice: Ultra leaves it alone.
+        self.assertEqual((p["flow_scale"], p["performance_mode"], self.file()["global"]["allow_fp16"]), (0.7, True, False))
         with self.assertRaisesRegex(schema.InvalidArgument, "Ultra performance"):
             self.b.profile_set("default", "flow_scale", 0.9)
         self.assertEqual(self.b.profile_get("default")["flow_scale"], 0.7)
@@ -160,13 +222,14 @@ class Backend(unittest.TestCase):
             self.b.profiles()
 
     def test_new_profiles_match_mako_ui(self):
-        # A profile as mako-ui creates it (MAKO 4.0.0), keys in its order.
+        # A profile as mako-ui creates it (MAKO 4.6.0), keys in its order.
         mako_ui = tomllib.loads("""[[profile]]
 adaptive = false
 adaptive_auto_base_fps_cap = false
 adaptive_fractional_real_frame_priority = "auto"
 adaptive_max_multiplier = 3
 adaptive_stable_cadence = true
+adaptive_target_refresh_rate = false
 base_fps_cap = 0
 dynamic_cadence_probe_interval_seconds = 2.0
 dynamic_cadence_recovery = false
@@ -175,6 +238,8 @@ frame_generation_enabled = true
 frame_generation_provisioned = true
 frame_generation_refresh_threshold = 0
 gamescope_vrr_mode = "follow-steam"
+gpu_headroom_percent = 0
+hdr_quality = "performance"
 multiplier = 2
 name = "nuevo"
 pacing = "none"
@@ -204,9 +269,8 @@ ultra_performance = false
     def test_updates_only_install_when_newer(self):
         u = self.b.updates
         calls = []
-        u.fetch_latest = lambda opener=None: {"version": "4.1.0", "url": "x"}
-        u.download = lambda version, opener=None: calls.append(version) or b"data"
-        u.install = lambda data, expected, prefix=None: calls.append(expected) or "done"
+        self.ctx.http.releases = github("4.1.0")
+        u.install = lambda archive, expected, extract: calls.append((Path(archive).read_bytes(), expected)) or "done"
         mine = {"path": "/x", "local": True, "owner": "standalone"}
         for have, state in ((None, "not_installed"), ({**mine, "version": "4.1.0"}, "up_to_date"),
                             ({**mine, "version": "4.2.0"}, "ahead"),
@@ -221,17 +285,33 @@ ultra_performance = false
                         self.b.update_install()
                 else:
                     self.assertEqual(self.b.update_install(), {"installed": "4.1.0"})
-        self.assertEqual(calls, ["4.1.0", "4.1.0", "4.1.0", "4.1.0"])
+        self.assertEqual(calls, [(b"tarball", "4.1.0")] * 2)
+        name = "MAKO-Renderer-v4.1.0-linux.tar.xz"
+        url = f"https://github.com/eugeniosegala/MAKO/releases/download/render-v4.1.0/{name}"
+        self.assertEqual([c[:3] for c in self.ctx.http.calls], [(url, name, ("sha256", "ab" * 32))] * 2)  # checked: no question
+        self.assertEqual([c[3] for c in self.ctx.http.calls], self.ctx.tasks)
+        self.assertEqual(self.ctx.tasks[0].label, "Updating MAKO Renderer to 4.1.0")
+        self.assertEqual(list((u.PREFIX / "share").iterdir()), [])  # the download is removed
+
+    def test_without_github_s_checksum_invasor_asks(self):
+        u = self.b.updates
+        self.ctx.http.releases = github("4.1.0", sha256=None)
+        u.installed = lambda: None
+        u.install = lambda *a: self.fail("must not install")
+        self.ctx.http.deny = schema.Unavailable("the download wasn't allowed")
+        with self.assertRaisesRegex(schema.Unavailable, "wasn't allowed"):
+            self.b.update_install()
+        self.assertIsNone(self.ctx.http.calls[0][2])  # no checksum: ctx.http asks the user
 
     def test_a_new_major_version_is_never_installed(self):
         u = self.b.updates
-        u.fetch_latest = lambda opener=None: {"version": "5.0.0", "url": "x"}
-        u.installed = lambda: {"version": "4.0.0", "path": "/x", "local": True, "owner": "standalone"}
-        u.download = lambda *a, **k: self.fail("must not download")
+        self.ctx.http.releases = github("5.0.0")
+        u.installed = lambda: {"version": "4.6.0", "path": "/x", "local": True, "owner": "standalone"}
         st = self.b.update_status()
         self.assertEqual((st["state"], st["latest_compat"], st["installed_compat"]), ("newer_available", "unsupported", "tested"))
         with self.assertRaisesRegex(schema.InvalidArgument, "new major version"):
             self.b.update_install()
+        self.assertEqual(self.ctx.http.calls, [])
 
     def test_launch_option_like_mako_ui(self):
         self.assertEqual(self.b.launch_option("default")["line"], "MAKO_PROFILE='default' ~/.local/bin/mako-launch %command%")
@@ -240,6 +320,66 @@ ultra_performance = false
         self.assertEqual(self.b.launch_option()["line"], "~/.local/bin/mako-launch %command%")
         with self.assertRaises(schema.InvalidArgument):
             self.b.launch_option("ghost")
+
+    def test_launch_option_merged_into_the_game_s_own(self):
+        m = self.b.merged
+        line = "~/.local/bin/mako-launch %command%"
+        self.assertEqual(m("", "p"), f"MAKO_PROFILE='p' {line}")
+        self.assertEqual(m("PROTON_LOG=1 FOO='a  b' mangohud %command% -dx12", "p"),
+                         f"MAKO_PROFILE='p' PROTON_LOG=1 FOO='a  b' mangohud {line} -dx12")
+        self.assertEqual(m("X=1 MAKO_PROFILE='old one' ~/.local/bin/mako-launch %command%", "p"), f"MAKO_PROFILE='p' X=1 {line}")
+        self.assertEqual(m("MAKO_PROFILE='it'\\''s' mako-launch %command%", "p"), f"MAKO_PROFILE='p' {line}")
+        self.assertEqual(m("-novid -high", "p"), f"MAKO_PROFILE='p' {line} -novid -high")  # only game arguments
+        mine = "WINE_X=1 MAKO_PROFILE='p' ~/.local/bin/mako-launch %command% --skip"
+        self.assertEqual(m(mine, "p"), mine)  # already there: left exactly as the user wrote it
+        mine = "WINE_X=1 MAKO_PROFILE='The Witcher 3' ~/.local/bin/mako-launch %command%"
+        self.assertEqual(m(mine, "The Witcher 3"), mine)
+
+    def test_launch_option_taken_out(self):
+        w = self.b.without
+        self.assertEqual(w("MAKO_PROFILE='The Witcher 3' ~/.local/bin/mako-launch %command%"), "")  # only %command% left: nothing
+        self.assertEqual(w("WINE_X=1 MAKO_PROFILE='p' ~/.local/bin/mako-launch %command% --skip"), "WINE_X=1 %command% --skip")
+        self.assertEqual(w("mangohud %command%"), "mangohud %command%")
+        self.assertEqual(w(""), "")
+
+    def test_remove_launch_option(self):
+        steam = self.ctx.steam
+        steam.lines["1000"] = "FOO=1 MAKO_PROFILE='default' ~/.local/bin/mako-launch %command%"
+        self.assertEqual(self.b.remove_launch_option("1000"), {"line": "FOO=1 %command%", "verified": True})
+        self.assertEqual(steam.lines["1000"], "FOO=1 %command%")
+        steam.lines["2000"] = "MAKO_PROFILE='default' ~/.local/bin/mako-launch %command%"
+        self.assertEqual(self.b.remove_launch_option("2000")["line"], "")
+        steam.can = False
+        with self.assertRaises(schema.Unavailable):
+            self.b.remove_launch_option("1000")
+
+    def test_apply_launch_option(self):
+        steam = self.ctx.steam
+        steam.lines["1000"] = "mangohud %command%"
+        self.assertTrue(self.b.launch_option("default")["can_apply"])
+        r = self.b.apply_launch_option("1000", "default")
+        self.assertEqual(r, {"line": "MAKO_PROFILE='default' mangohud ~/.local/bin/mako-launch %command%", "verified": True})
+        self.assertEqual(steam.lines["1000"], r["line"])
+        self.assertEqual(self.b.apply_launch_option("1000", "default")["line"], r["line"])  # applying again changes nothing
+        with self.assertRaises(schema.InvalidArgument):
+            self.b.apply_launch_option("1000", "ghost")
+        steam.can = False
+        self.assertFalse(self.b.launch_option("default")["can_apply"])
+        with self.assertRaisesRegex(schema.Unavailable, "copy"):
+            self.b.apply_launch_option("1000", "default")
+
+    def test_battery_and_ac_settings_become_one(self):
+        data = self.file()
+        data["profile"][0]["handheld"] = {"multiplier": 3}
+        data["profile"][0]["docked"] = {"multiplier": 4}
+        self.path.write_text(tomlio.dumps(data))
+        self.assertTrue(self.b.profiles()[0]["power_modes"])
+        self.assertTrue(self.b.profile_unify("default"))
+        self.assertFalse(self.b.profiles()[0]["power_modes"])
+        self.assertNotIn("handheld", self.file()["profile"][0])
+        self.assertNotIn("docked", self.file()["profile"][0])
+        with self.assertRaises(schema.InvalidArgument):
+            self.b.profile_unify("ghost")
 
     def test_rename_and_delete_touch_only_conf_toml(self):
         before = sorted(p.name for p in self.path.parent.iterdir())
@@ -253,9 +393,13 @@ ultra_performance = false
         import os
         os.environ["MAKO_LAUNCH_CONFIG"] = str(self.path.parent / "launcher.conf")
         self.addCleanup(os.environ.pop, "MAKO_LAUNCH_CONFIG")
-        self.assertEqual(self.b.launcher_get(), {"enable_zink": False, "force_alsa_audio": False})
+        self.assertEqual(self.b.launcher_get(), {"disable_steam_overlay": True, "enable_hdr": False, "enable_zink": False, "force_alsa_audio": False})
         self.assertTrue(self.b.launcher_set("enable_zink", True))
-        self.assertEqual((self.path.parent / "launcher.conf").read_text(), "version=1\nenable_zink=1\nforce_alsa_audio=0\n")
+        self.assertTrue(self.b.launcher_set("enable_hdr", True))  # kept as disable_hdr_exposure, as mako-ui does
+        self.assertFalse(self.b.launcher_set("disable_steam_overlay", False))
+        self.assertEqual((self.path.parent / "launcher.conf").read_text(),
+                         "version=1\ndisable_hdr_exposure=0\ndisable_steam_overlay=0\nenable_zink=1\nforce_alsa_audio=0\n")
+        self.assertEqual(self.b.launcher_get(), {"disable_steam_overlay": False, "enable_hdr": True, "enable_zink": True, "force_alsa_audio": False})
         (self.path.parent / "launcher.conf").write_text("version=9\n")
         with self.assertRaises(schema.Unavailable):
             self.b.launcher_set("enable_zink", False)
@@ -283,28 +427,6 @@ ultra_performance = false
         self.b._cli = lambda: str(self.path.parent / "missing-cli")
         with self.assertLogs("test.pescao", "WARNING"):
             self.assertEqual(self.b.profile_set("default", "multiplier", 4), 4)
-
-
-    def test_older_core_without_the_validate_hook(self):
-        real_save = self.b.ctx.toml.save
-
-        class OldToml:
-            dumps = staticmethod(self.b.ctx.toml.dumps)
-            load = staticmethod(self.b.ctx.toml.load)
-
-            @staticmethod
-            def save(path, data, expected_mtime=None, backup=True):
-                return real_save(path, data, expected_mtime, backup)
-
-        self.b.ctx.toml = OldToml
-        before = self.path.read_text()
-        self.fake_cli(1, "Validation failed: unknown pacing method: x")
-        with self.assertRaisesRegex(schema.InvalidArgument, "rejected"):
-            self.b.profile_set("default", "multiplier", 5)
-        self.assertEqual(self.path.read_text(), before)
-        self.assertEqual([p.name for p in self.path.parent.iterdir() if ".check-" in p.name], [])
-        self.fake_cli(0)
-        self.assertEqual(self.b.profile_set("default", "multiplier", 5), 5)
 
 
 if __name__ == "__main__":

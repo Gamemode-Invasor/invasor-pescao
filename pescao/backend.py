@@ -6,8 +6,7 @@ ctx.toml (all keys kept, verified, atomic, refused if mako-ui saved meanwhile).
 A game uses a profile when its id (Steam or non-Steam shortcut) is in that profile's
 active_in, and MAKO only runs in games launched through mako-launch.
 """
-import inspect
-import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -65,10 +64,9 @@ def _mako_validate(tmp_path):
         ctx.log.warning("mako-cli couldn't validate (%s): saving with Pescao's own checks", e)
 
 
-def mako_problem(path=None):
-    """MAKO's complaint about the current conf.toml, or None if it accepts it (or can't
-    be asked)."""
-    path = path or mako.config_path()
+def mako_problem(path):
+    """MAKO's complaint about conf.toml at `path`, or None if it accepts it (or can't be
+    asked)."""
     cli = _cli()
     if cli is None or not path.exists():
         return None
@@ -77,7 +75,7 @@ def mako_problem(path=None):
     except validator.Rejected as e:
         return str(e)
     except (OSError, TimeoutError):
-        return None
+        pass
     return None
 
 
@@ -89,29 +87,13 @@ def _change(fn):
         result = fn(data)
     except (ValueError, KeyError) as e:
         raise ctx.InvalidArgument(_msg(e)) from None
-    _save(path, data, mtime)
+    ctx.toml.save(path, data, mtime, validate=_mako_validate)
     return result
-
-
-def _save(path, data, mtime):
-    """ctx.toml.save with MAKO's validation. Invasor cores older than the `validate`
-    hook get the same check here: the new file is written aside, validated, removed."""
-    if "validate" in inspect.signature(ctx.toml.save).parameters:
-        ctx.toml.save(path, data, mtime, validate=_mako_validate)
-        return
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.check-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(ctx.toml.dumps(data))
-        _mako_validate(Path(tmp))
-    finally:
-        os.unlink(tmp)
-    ctx.toml.save(path, data, mtime)
 
 
 def status():
     path = mako.config_path()
-    out = {"installed": mako.installed(), "path": str(path), "exists": path.exists(), "error": None, "mako_problem": None}
+    out = {"installed": updates.installed() is not None, "path": str(path), "error": None, "mako_problem": None}
     try:
         _read()
     except (ctx.Unavailable, ctx.InvalidArgument) as e:
@@ -122,7 +104,8 @@ def status():
 
 
 def profiles():
-    """[{name, games: [{entry, name}]}]: every profile and the games that use it."""
+    """[{name, games: [{entry, name}], power_modes}]: every profile, the games that use it,
+    and whether it has separate battery/AC options (mako.has_power_modes)."""
     _, data, _ = _read()
     out = []
     for p in data.get("profile", []):
@@ -132,16 +115,12 @@ def profiles():
             if isinstance(entry, str) and entry.isascii() and entry.isdigit():
                 label = (ctx.game.info(entry) or {}).get("name")
             games.append({"entry": entry, "name": label})
-        out.append({"name": p.get("name"), "games": games})
+        out.append({"name": p.get("name"), "games": games, "power_modes": mako.has_power_modes(p)})
     return out
 
 
 def profile_get(name):
-    _, data, _ = _read()
-    try:
-        return ctx.forms["profile"].clean(mako.find(data, name))
-    except KeyError as e:
-        raise ctx.InvalidArgument(_msg(e)) from None
+    return ctx.forms["profile"].clean(_profile(name))
 
 
 def profile_set(name, key, value):
@@ -166,10 +145,15 @@ def profile_delete(name):
     return True
 
 
+def profile_unify(name):
+    """Drop the profile's separate battery/AC options: MAKO then uses its general ones."""
+    _change(lambda data: mako.unify(mako.find(data, name)))
+    return True
+
+
 def global_get():
     _, data, _ = _read()
-    values = ctx.forms["global"].clean(data.get("global", {}))
-    return values
+    return ctx.forms["global"].clean(data.get("global", {}))
 
 
 def global_set(key, value):
@@ -178,34 +162,34 @@ def global_set(key, value):
     return value
 
 
-def _entry(appid, shortcut):
+def _entry(appid):
     try:
-        return mako.game_entry(appid, shortcut)
+        return mako.game_entry(appid)
     except ValueError as e:
         raise ctx.InvalidArgument(str(e)) from None
 
 
-def game_profile(appid, shortcut=False):
+def game_profile(appid):
     """{entry, profile, custom}: what identifies the game in active_in, its profile (or
     None), and whether that profile is the game's own (only this game uses it)."""
-    entry = _entry(appid, shortcut)
+    entry = _entry(appid)
     _, data, _ = _read()
     name = mako.game_profile(data, entry)
     return {"entry": entry, "profile": name, "custom": name is not None and mako.is_custom(data, name, entry)}
 
 
-def make_custom(appid, shortcut=False, title=None):
+def make_custom(appid, title=None):
     """Give the game its own profile (named after it, starting from its current values)."""
-    entry = _entry(appid, shortcut)
+    entry = _entry(appid)
     title = title or (ctx.game.info(appid) or {}).get("name") or entry
     name = _change(lambda data: mako.make_custom(data, entry, title, ctx.forms["profile"].defaults()))
     ctx.log.info("game %s (%s) -> its own profile %r", appid, entry, name)
     return {"entry": entry, "profile": name, "custom": True}
 
 
-def set_game_profile(appid, shortcut=False, name=None):
+def set_game_profile(appid, name=None):
     """Use profile `name` for the game from its next launch; None turns it off."""
-    entry = _entry(appid, shortcut)
+    entry = _entry(appid)
     _change(lambda data: mako.assign(data, entry, name))
     ctx.log.info("game %s (%s) -> profile %r", appid, entry, name)
     return {"entry": entry, "profile": name}
@@ -226,17 +210,30 @@ def _quote(value):
 
 # ---------- mako-launch's own settings ----------
 
-def launcher_get():
+# Shown as "HDR" (on/off), as mako-ui does; launcher.conf keeps it the other way round.
+HDR = "enable_hdr"
+
+
+def _launcher_load():
     try:
         return launcher.load()
     except launcher.Invalid as e:
         raise ctx.Unavailable(f"{launcher.path()} isn't valid ({e}): mako-launch ignores it; fix or remove it") from None
 
 
+def launcher_get():
+    settings = _launcher_load()
+    settings[HDR] = not settings.pop("disable_hdr_exposure")
+    return settings
+
+
 def launcher_set(key, value):
     value = ctx.forms["launcher"].coerce(key, value)
-    settings = launcher_get()
-    settings[key] = value
+    settings = _launcher_load()
+    if key == HDR:
+        settings["disable_hdr_exposure"] = not value
+    else:
+        settings[key] = value
     try:
         launcher.save(settings)
     except OSError as e:
@@ -244,16 +241,87 @@ def launcher_set(key, value):
     return value
 
 
+# ---------- the game's launch option ----------
+
+LAUNCH = "~/.local/bin/mako-launch %command%"
+# What a line may already hold of an earlier launch option: MAKO_PROFILE=… (quoted or not) and mako-launch.
+# Each with the space before it, so the rest of the line is left exactly as it was.
+OLD_PROFILE = re.compile(r"""(?:^|\s+)MAKO_PROFILE=(?:'(?:[^']|'\\'')*'|"[^"]*"|\S*)(?=\s|$)""")
+OLD_LAUNCH = re.compile(r"(?:^|\s+)\S*mako-launch(?=\s|$)")
+
+
+def _rest(current):
+    """The launch options without anything of Pescao's (MAKO_PROFILE, mako-launch)."""
+    return OLD_LAUNCH.sub("", OLD_PROFILE.sub("", current or "")).strip()
+
+
+def merged(current, name):
+    """The game's launch options with this profile's launch option in: an earlier one is
+    replaced, the user's own variables and wrappers stay before mako-launch (MAKO_PROFILE
+    goes first, so any wrapper passes it on), and game arguments stay after %command%.
+    A line that already runs mako-launch with this profile is left as it is."""
+    current, profile = current or "", f"MAKO_PROFILE={_quote(name)}"
+    if re.search(rf"(?:^|\s){re.escape(profile)}(?=\s|$)", current) and OLD_LAUNCH.search(current):
+        return current
+    rest = _rest(current)
+    before, sep, after = rest.partition("%command%")
+    if not sep:  # no %command%: what's there are the game's arguments
+        before, after = "", (" " + rest if rest else "")
+    return " ".join(p for p in (profile, before.strip(), LAUNCH) if p) + after.rstrip()
+
+
+def without(current):
+    """The game's launch options with Pescao's launch option taken out; nothing at all if
+    only %command% is left."""
+    rest = _rest(current)
+    return "" if rest == "%command%" else rest
+
+
+def _can_apply():
+    try:
+        return ctx.steam.supports("set_launch_options")
+    except ctx.Unavailable:
+        return False
+
+
 def launch_option(name=None):
-    """{line, found}: the launch option for a profile, as mako-ui builds it, and whether
-    mako-launch is installed. MAKO_PROFILE is what makes MAKO use the profile: MAKO 4.0
-    matches active_in against executables and process names, not Steam ids."""
-    parts = []
+    """{line, found, can_apply}: the launch option for a profile, as mako-ui builds it,
+    whether mako-launch is installed, and whether Steam lets Pescao set it on a game.
+    MAKO_PROFILE is what makes MAKO use the profile: MAKO 4 matches active_in against
+    executables and process names, not Steam ids."""
+    line = LAUNCH
     if name is not None:
         _profile(name)
-        parts.append(f"MAKO_PROFILE={_quote(name)}")
-    parts.append("~/.local/bin/mako-launch %command%")
-    return {"line": " ".join(parts), "found": (updates.PREFIX / "bin" / "mako-launch").is_file()}
+        line = f"MAKO_PROFILE={_quote(name)} {LAUNCH}"
+    return {"line": line, "found": (updates.PREFIX / "bin" / "mako-launch").is_file(), "can_apply": _can_apply()}
+
+
+def _set_launch(appid, change, refused, done):
+    """Set the game's launch options to change(current), on the user's action: {line, verified}.
+    A line that doesn't change leaves Steam alone."""
+    if not _can_apply():
+        raise ctx.Unavailable(f"Steam can't set launch options here: {refused}")
+    current = ctx.steam.launch_options(appid)
+    line = change(current)
+    if line == current:
+        return {"line": line, "verified": True}
+    res = ctx.steam.set_launch_options(appid, line)
+    ctx.log.info("game %s: %s", appid, done)
+    return {"line": line, "verified": res["verified"]}
+
+
+def apply_launch_option(appid, name):
+    """Put the profile's launch option in the game's launch options, keeping the user's own
+    (merged). Without Steam's call, Copy is the way."""
+    _profile(name)
+    return _set_launch(appid, lambda current: merged(current, name), "copy the line and paste it",
+                       f"launch options set for profile {name!r}")
+
+
+def remove_launch_option(appid):
+    """Take Pescao's launch option out of the game's launch options (without()), leaving the
+    user's own."""
+    return _set_launch(appid, without, "remove mako-launch from them in Steam", "MAKO taken out of its launch options")
 
 
 def update_status():
@@ -261,11 +329,12 @@ def update_status():
     latest stable on GitHub (asked only now, never in the background).
     state: newer_available, up_to_date, ahead (installed is newer: nothing offered),
     decky (managed by MAKO Decky), system (outside ~/.local), not_installed."""
+    return _status(_latest())
+
+
+def _status(release):
     have = updates.installed()
-    try:
-        latest = updates.fetch_latest()["version"]
-    except updates.UpdateError as e:
-        raise ctx.Unavailable(str(e)) from None
+    latest = release["version"]
     if have is None:
         state = "not_installed"
     elif not have["local"]:
@@ -285,6 +354,14 @@ def update_status():
     }
 
 
+def _latest():
+    """The newest stable Renderer release on GitHub: {version, url, sha256}."""
+    try:
+        return updates.latest_stable(ctx.http.get_json(updates.RELEASES, max_bytes=updates.MAX_RELEASES))
+    except updates.UpdateError as e:
+        raise ctx.Unavailable(str(e)) from None
+
+
 def compat():
     """{installed, compat, tested}: whether the installed MAKO is the series Pescao was
     tested with (no network)."""
@@ -294,9 +371,11 @@ def compat():
 
 
 def update_install():
-    """Download the latest stable MAKO Renderer and install it with MAKO's own installer,
-    only when it's newer than what's installed (or MAKO isn't installed)."""
-    status = update_status()
+    """Download the latest stable MAKO Renderer (checked against the sha256 GitHub publishes
+    for it) and install it with MAKO's own installer, only when it's newer than what's
+    installed (or MAKO isn't installed)."""
+    release = _latest()
+    status = _status(release)
     if status["state"] not in ("newer_available", "not_installed"):
         raise ctx.InvalidArgument({
             "up_to_date": "MAKO Renderer is already up to date",
@@ -306,12 +385,20 @@ def update_install():
         }[status["state"]])
     if status["latest_compat"] == "unsupported":
         raise ctx.InvalidArgument(f"MAKO Renderer {status['latest']} is a new major version: update Pescao first")
+    version = release["version"]
+    checksum = ("sha256", release["sha256"]) if release["sha256"] else None  # without one, ctx.http asks
+    work = updates.PREFIX / "share"
     try:
-        said = updates.install(updates.download(status["latest"]), status["latest"])
+        work.mkdir(parents=True, exist_ok=True)
+        with ctx.task(f"Updating MAKO Renderer to {version}") as t, \
+                tempfile.TemporaryDirectory(prefix=".pescao-mako-download-", dir=work) as tmp:
+            got = ctx.http.download(release["url"], Path(tmp) / updates.asset_name(version), checksum=checksum, task=t)
+            t.update(None, "Installing")
+            said = updates.install(got["path"], version, ctx.archive.extract)
     except updates.UpdateError as e:
         raise ctx.Unavailable(str(e)) from None
-    ctx.log.info("installed MAKO Renderer %s into %s (%s)", status["latest"], updates.PREFIX, said)
-    return {"installed": status["latest"]}
+    ctx.log.info("installed MAKO Renderer %s into %s (%s)", version, updates.PREFIX, said)
+    return {"installed": version}
 
 
 METHODS = {
@@ -322,12 +409,15 @@ METHODS = {
     "profile_create": profile_create,
     "profile_rename": profile_rename,
     "profile_delete": profile_delete,
+    "profile_unify": profile_unify,
     "global_get": global_get,
     "global_set": global_set,
     "game_profile": game_profile,
     "set_game_profile": set_game_profile,
     "make_custom": make_custom,
     "launch_option": launch_option,
+    "apply_launch_option": apply_launch_option,
+    "remove_launch_option": remove_launch_option,
     "launcher_get": launcher_get,
     "launcher_set": launcher_set,
     "update_status": update_status,

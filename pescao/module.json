@@ -1,8 +1,8 @@
 {
   "api": 1,
   "name": "Pescao",
-  "version": "0.2.1",
-  "min_core": "0.1.3",
+  "version": "0.2.5",
+  "min_core": "0.3.0",
   "author": "FranjeGueje",
   "description": "Frame generation and scaling profiles for MAKO Renderer: edit them and choose one per game.",
   "order": 35,
@@ -110,7 +110,17 @@
             "max": 1000,
             "step": 5,
             "default": 120,
-            "hint": "Output frame rate to aim for. A goal, not a promise: an unreachable target is simply missed."
+            "hint": "Output frame rate to aim for. A goal, not a promise: an unreachable target is simply missed. With Match display refresh rate on, only used if the refresh rate can't be read.",
+            "disabled_when": {
+              "adaptive_target_refresh_rate": true
+            }
+          },
+          {
+            "key": "adaptive_target_refresh_rate",
+            "type": "toggle",
+            "label": "Match display refresh rate",
+            "default": false,
+            "hint": "Aims at the display's current refresh rate instead of Target FPS, and follows it when it changes during play."
           },
           {
             "key": "adaptive_max_multiplier",
@@ -290,7 +300,39 @@
             "type": "toggle",
             "label": "Ultra performance",
             "default": false,
-            "hint": "A preset: flow scale 0.7, the lighter model and FP16 (and LS1 Performance when scaling), locked while it's on. Turning it off puts flow scale back to 0.8. Applies on the next launch."
+            "hint": "A preset: flow scale 0.7 and the lighter model (and LS1 Performance when scaling), locked while it's on. FP16 follows the global Allow FP16. Turning it off puts flow scale back to 0.8. Applies on the next launch."
+          },
+          {
+            "key": "gpu_headroom_percent",
+            "type": "select",
+            "label": "GPU headroom",
+            "default": 0,
+            "options": [
+              {
+                "value": 0,
+                "label": "Off"
+              },
+              {
+                "value": 5,
+                "label": "5%"
+              },
+              {
+                "value": 10,
+                "label": "10%"
+              },
+              {
+                "value": 15,
+                "label": "15%"
+              },
+              {
+                "value": 20,
+                "label": "20%"
+              }
+            ],
+            "hint": "Lowers real frames to keep this much GPU spare (10% aims at about 90% use). Needs an AMD GPU. May reduce stutter, but can add input lag. Turns Dynamic cadence recovery off.",
+            "when": {
+              "frame_generation_provisioned": true
+            }
           },
           {
             "key": "gpu",
@@ -303,6 +345,33 @@
             "when": {
               "frame_generation_provisioned": true
             }
+          }
+        ]
+      },
+      {
+        "section": "HDR",
+        "open": false,
+        "items": [
+          {
+            "key": "hdr_quality",
+            "type": "select",
+            "label": "HDR quality",
+            "default": "performance",
+            "options": [
+              {
+                "value": "quality",
+                "label": "Quality"
+              },
+              {
+                "value": "balanced",
+                "label": "Balanced"
+              },
+              {
+                "value": "performance",
+                "label": "Performance"
+              }
+            ],
+            "hint": "Only used with HDR on (Manage › Launcher). Quality keeps full precision; Balanced uses compact buffers; Performance also lowers HDR10 motion detail. Output resolution stays the same."
           }
         ]
       },
@@ -324,7 +393,7 @@
             "type": "toggle",
             "label": "Dynamic cadence recovery",
             "default": false,
-            "hint": "Rechecks the game's native cadence, for games that change frame rate between menus and play. Turning it on clears the real-frame caps (Base FPS cap, Steady base cap, Real frame priority)."
+            "hint": "Rechecks the game's native cadence, for games that change frame rate between menus and play. Turning it on clears the real-frame caps (Base FPS cap, Steady base cap, Real frame priority) and GPU headroom."
           },
           {
             "key": "dynamic_cadence_probe_interval_seconds",
@@ -356,7 +425,7 @@
         "type": "toggle",
         "label": "Allow FP16",
         "default": true,
-        "hint": "Lets frame generation use half precision where the GPU supports it. Ultra performance turns it on. Applies on the next launch."
+        "hint": "Lets frame generation and MAKO Scaler use half precision where the GPU supports it; off uses full precision (FP32). LS1 always uses FP32. Applies on the next launch."
       },
       {
         "key": "dll",
@@ -369,6 +438,20 @@
       }
     ],
     "launcher": [
+      {
+        "key": "disable_steam_overlay",
+        "type": "toggle",
+        "label": "Disable Steam overlay",
+        "default": true,
+        "hint": "May reduce stutter. Turns off Steam's in-game overlay and its FPS counter in Desktop Mode and may affect Steam Input; Gaming Mode menus and the performance overlay still work. All games started with mako-launch, from their next start."
+      },
+      {
+        "key": "enable_hdr",
+        "type": "toggle",
+        "label": "HDR (experimental)",
+        "default": false,
+        "hint": "For external HDR displays; HDR must also be on in the game. Each profile's HDR quality is under its HDR section. All games started with mako-launch, from their next start."
+      },
       {
         "key": "enable_zink",
         "type": "toggle",
