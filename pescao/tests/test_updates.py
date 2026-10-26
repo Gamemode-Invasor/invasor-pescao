@@ -6,15 +6,18 @@ import unittest
 from pathlib import Path
 
 import updates
+from invasor import archive, schema
+
+BAD = (updates.UpdateError, schema.InvalidArgument)
 
 LAYER_JSON = {"layer": {"name": "VK_LAYER_MAKO_render", "library_path": "../../../lib/libmako-render.so"}}
 
 
-def release(tag, version=None, draft=False, prerelease=False, asset=True):
+def release(tag, version=None, draft=False, prerelease=False, asset=True, digest="sha256:" + "ab" * 32):
     version = version or tag.removeprefix("render-v")
     name = updates.asset_name(version)
     return {"tag_name": tag, "draft": draft, "prerelease": prerelease,
-            "assets": [{"name": name, "browser_download_url": f"{updates.DOWNLOAD_PREFIX}{tag}/{name}"}] if asset else []}
+            "assets": [{"name": name, "browser_download_url": f"{updates.DOWNLOAD_PREFIX}{tag}/{name}", "digest": digest}] if asset else []}
 
 
 def fake_library(*versions):
@@ -91,7 +94,11 @@ class Versions(unittest.TestCase):
             release("render-v4.1.1", asset=False),
         ]
         self.assertEqual(updates.latest_stable(releases),
-                         {"version": "4.1.0", "url": f"{updates.DOWNLOAD_PREFIX}render-v4.1.0/MAKO-Renderer-v4.1.0-linux.tar.xz"})
+                         {"version": "4.1.0", "url": f"{updates.DOWNLOAD_PREFIX}render-v4.1.0/MAKO-Renderer-v4.1.0-linux.tar.xz",
+                          "sha256": "ab" * 32})
+        for digest in (None, "md5:abc", "sha256:xyz"):  # no checksum GitHub can vouch for: ctx.http asks
+            with self.subTest(digest=digest):
+                self.assertIsNone(updates.latest_stable([release("render-v4.1.0", digest=digest)])["sha256"])
         odd = release("render-v4.3.0")
         odd["assets"][0]["browser_download_url"] = "https://evil.example/x.tar.xz"
         self.assertEqual(updates.latest_stable([odd, release("render-v4.0.0")])["version"], "4.0.0")
@@ -144,17 +151,24 @@ class Installed(unittest.TestCase):
 
 
 class Install(unittest.TestCase):
+    """install() with the core's own extract (what ctx.archive.extract runs)."""
+
     def setUp(self):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         self.prefix = Path(d.name) / ".local"
+        self.tarball = Path(d.name) / "mako.tar.xz"
+
+    def install(self, data, expected="4.1.0"):
+        self.tarball.write_bytes(data)
+        return updates.install(self.tarball, expected, archive.extract, self.prefix)
 
     def leftovers(self):
         share = self.prefix / "share"
         return [p.name for p in share.iterdir() if p.name.startswith(".")] if share.exists() else []
 
     def test_runs_mako_installer(self):
-        said = updates.install(tarball("4.1.0"), "4.1.0", self.prefix)
+        said = self.install(tarball("4.1.0"))
         self.assertIn("installed", said)
         found = updates.installed([self.prefix / "share/vulkan/implicit_layer.d"], self.prefix)
         self.assertEqual((found["version"], found["owner"]), ("4.1.0", "standalone"))
@@ -165,38 +179,37 @@ class Install(unittest.TestCase):
             "not xz": b"nope",
             "traversal": tarball(extra={"./bin/../../evil": b"x"}),
             "absolute": tarball(extra={"/etc/evil": b"x"}),
-            "unknown top file": tarball(extra={"./run-me.sh": b"x"}),
-            "unknown top folder": tarball(extra={"./etc/thing": b"x"}),
             "symlink": tarball(links=["./lib/link.so"]),
             "no installer": tarball(skip={"Install MAKO Renderer"}),
             "no version file": tarball(skip={"MAKO-Renderer-version.txt"}),
             "another version": tarball("4.0.9"),
         }
         for label, data in cases.items():
-            with self.subTest(case=label), self.assertRaises(updates.UpdateError):
-                updates.install(data, "4.1.0", self.prefix)
+            with self.subTest(case=label), self.assertRaises(BAD):
+                self.install(data)
         self.assertFalse((self.prefix / "lib").exists())
         self.assertEqual(self.leftovers(), [])
 
     def test_installer_failure_and_wrong_result(self):
         failing = "#!/bin/sh\necho 'The package file lib/x does not match its recorded checksum.' >&2\nexit 1\n"
         with self.assertRaisesRegex(updates.UpdateError, "installer failed: The package file"):
-            updates.install(tarball(installer=failing), "4.1.0", self.prefix)
+            self.install(tarball(installer=failing))
         with self.assertRaisesRegex(updates.UpdateError, "reports"):
-            updates.install(tarball("4.1.0", lib_version="4.0.0"), "4.1.0", self.prefix)
+            self.install(tarball("4.1.0", lib_version="4.0.0"))
         self.assertEqual(self.leftovers(), [])
 
-    def test_downloads_only_from_github(self):
-        for version in ("4.1.0-rc1", "../x", "latest"):
-            with self.subTest(version=version), self.assertRaises(updates.UpdateError):
-                updates.download(version, opener=lambda *a, **k: None)
-        with self.assertRaises(updates.UpdateError):
-            updates._get("https://evil.example/x", 10, opener=lambda *a, **k: None)
-        with self.assertRaises(updates.UpdateError):
-            updates._get("http://github.com/x", 10, opener=lambda *a, **k: None)
-        handler = updates._OnlyGitHub()
-        with self.assertRaises(updates.UpdateError):
-            handler.redirect_request(None, None, 302, "Found", {}, "https://evil.example/x")
+    def test_only_what_a_renderer_archive_holds_is_unpacked(self):
+        seen = []
+
+        def extract(archive_path, dest, only_top):
+            seen.append(only_top)
+            return archive.extract(archive_path, dest, only_top=only_top)
+
+        self.tarball.write_bytes(tarball(extra={"./run-me.sh": b"x", "./etc/thing": b"x"}))
+        updates.install(self.tarball, "4.1.0", extract, self.prefix)
+        self.assertEqual(set(seen[0]), {"bin", "lib", "lib32", "share", "Install MAKO Renderer",
+                                        "MAKO-Renderer-version.txt", "MAKO-Renderer-install-manifest.txt", "README.txt"})
+        self.assertFalse((self.prefix / "etc").exists())
 
 
 if __name__ == "__main__":

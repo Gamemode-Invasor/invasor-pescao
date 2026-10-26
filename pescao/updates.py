@@ -2,7 +2,9 @@
 it with MAKO's own installer, the way MAKO documents for standalone installs ("run the
 installer again to update").
 
-Pure stdlib, no Invasor imports: tested on its own (tests/test_updates.py).
+Pure stdlib, no Invasor imports: tested on its own (tests/test_updates.py). The backend reads
+the release list and downloads with ctx.http (checked against the sha256 GitHub publishes for each
+file), and unpacks with the `extract` it passes in (ctx.archive.extract).
 
 - What's installed is read from MAKO itself: its layer library carries its version as
   a string ("4.0.0"), and ~/.local/share/mako-render/active-renderer.json (written by
@@ -10,35 +12,25 @@ Pure stdlib, no Invasor imports: tested on its own (tests/test_updates.py).
   managed by MAKO Decky (or installed outside ~/.local) is never touched.
 - Releases: GitHub's release list for eugeniosegala/MAKO. Renderer releases are tagged
   render-vX.Y.Z (MAKO Decky's are plugin-v…); drafts and pre-releases are skipped.
-- Installing: every archive entry is checked first (relative paths, regular files and
-  folders only, nothing outside what a Renderer archive holds), the archive is unpacked
-  to a temporary folder, its version file must say the expected version, and then its
-  own "Install MAKO Renderer" runs without questions (MAKO_INSTALLER_ASSUME_YES=1,
-  MAKO_INSTALLER_NO_LAUNCH=1, no display). That installer checks each file against its
+- Installing: only what a Renderer archive holds is unpacked to a temporary folder
+  (extract refuses links and paths leading out), its version file must say the expected
+  version, and then its own "Install MAKO Renderer" runs without questions
+  (MAKO_INSTALLER_ASSUME_YES=1, MAKO_INSTALLER_NO_LAUNCH=1, no display). That installer checks each file against its
   manifest, installs in one transaction with rollback and keeps the profiles.
 """
-import io
 import json
 import os
 import re
 import shutil
 import subprocess
-import tarfile
 import tempfile
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 REPO = "eugeniosegala/MAKO"
 RELEASES = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
 DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/"
-# GitHub serves release files from github.com, which redirects to its asset hosts.
-HOSTS = ("api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com")
-USER_AGENT = "invasor-pescao"
-TIMEOUT = 20
+MAX_RELEASES = 4 << 20  # GitHub's answer for 30 releases is about 300 KB
 INSTALL_TIMEOUT = 180
-MAX_DOWNLOAD = 64 << 20
 PREFIX = Path.home() / ".local"
 LAYER_JSON = "VkLayer_MAKO_render.json"
 STATE = "share/mako-render/active-renderer.json"
@@ -58,6 +50,7 @@ TOP_DIRS = ("bin", "lib", "lib32", "share")
 TOP_FILES = (INSTALLER, VERSION_FILE, MANIFEST, "README.txt")
 
 TAG = re.compile(r"^render-v(\d+\.\d+\.\d+)$")
+DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
 VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?")
 # Version strings inside the layer library: whole NUL-separated strings.
 EMBEDDED = re.compile(rb"(?<![\w.-])(\d{1,3}\.\d{1,3}\.\d{1,3}(?:-[0-9A-Za-z.]{1,20})?)\x00")
@@ -111,7 +104,8 @@ def asset_name(version):
 
 
 def latest_stable(releases):
-    """{version, url} of the newest stable Renderer release in GitHub's release list."""
+    """{version, url, sha256} of the newest stable Renderer release in GitHub's release list
+    (sha256: of its Linux archive, as GitHub publishes it; None if it has none)."""
     best = None
     for r in releases if isinstance(releases, list) else []:
         if not isinstance(r, dict) or r.get("draft") or r.get("prerelease"):
@@ -120,12 +114,14 @@ def latest_stable(releases):
         if not m:
             continue  # MAKO Decky's releases and anything else
         version = m.group(1)
-        url = next((a.get("browser_download_url") for a in r.get("assets") or []
-                    if isinstance(a, dict) and a.get("name") == asset_name(version)), None)
+        asset = next((a for a in r.get("assets") or []
+                      if isinstance(a, dict) and a.get("name") == asset_name(version)), {})
+        url = asset.get("browser_download_url")
         if url != f"{DOWNLOAD_PREFIX}render-v{version}/{asset_name(version)}":
             continue  # no Linux archive (or an unexpected link)
+        digest = DIGEST.match(str(asset.get("digest") or ""))
         if best is None or parse_version(version) > parse_version(best["version"]):
-            best = {"version": version, "url": url}
+            best = {"version": version, "url": url, "sha256": digest and digest.group(1)}
     if best is None:
         raise UpdateError("GitHub lists no stable MAKO Renderer release")
     return best
@@ -190,103 +186,27 @@ def installed(dirs=LAYER_DIRS, prefix=PREFIX):
     return {"version": version, "path": str(lib), "local": local, "owner": owner}
 
 
-# ---------- downloading and installing ----------
-
-class _OnlyGitHub(urllib.request.HTTPRedirectHandler):
-    """Follow redirects only to GitHub's own hosts, over https."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        parts = urllib.parse.urlparse(newurl)
-        if parts.scheme != "https" or parts.hostname not in HOSTS:
-            raise UpdateError(f"refusing to follow a redirect to {parts.hostname or newurl!r}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-_opener = urllib.request.build_opener(_OnlyGitHub()).open
-
-
-def _get(url, limit, opener=None, accept=None):
-    parts = urllib.parse.urlparse(url)
-    if parts.scheme != "https" or parts.hostname not in HOSTS:
-        raise UpdateError(f"refusing to download from {parts.hostname or url!r}")
-    headers = {"User-Agent": USER_AGENT}
-    if accept:
-        headers["Accept"] = accept
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with (opener or _opener)(req, timeout=TIMEOUT) as res:
-            data = res.read(limit + 1)
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise UpdateError(f"can't reach GitHub ({getattr(e, 'reason', e)})") from None
-    if len(data) > limit:
-        raise UpdateError("download too large")
-    return data
-
-
-def fetch_latest(opener=None):
-    raw = _get(RELEASES, 4 << 20, opener, accept="application/vnd.github+json")
-    try:
-        releases = json.loads(raw)
-    except ValueError:
-        raise UpdateError("GitHub's answer isn't valid JSON") from None
-    return latest_stable(releases)
-
-
-def download(version, opener=None):
-    if not re.fullmatch(r"\d+\.\d+\.\d+", str(version)):
-        raise UpdateError(f"not a stable release: {version!r}")
-    return _get(f"{DOWNLOAD_PREFIX}render-v{version}/{asset_name(version)}", MAX_DOWNLOAD, opener)
-
-
-def _members(tar):
-    """Every entry, checked; (relative path, member) of the regular files to unpack."""
-    files = []
-    for m in tar.getmembers():
-        path = PurePosixPath(m.name)
-        parts = [p for p in path.parts if p not in (".", "")]
-        if path.is_absolute() or ".." in parts:
-            raise UpdateError(f"unsafe path in the archive: {m.name!r}")
-        if not parts:
-            continue
-        loose_file = len(parts) == 1 and not m.isdir()
-        if parts[0] not in (TOP_FILES if loose_file else TOP_DIRS):
-            raise UpdateError(f"unexpected file in the archive: {m.name!r}")
-        if m.isdir():
-            continue
-        if not m.isfile():
-            raise UpdateError(f"the archive contains a link or special file: {m.name!r}")
-        files.append(("/".join(parts), m))
-    names = {rel for rel, _ in files}
-    for needed in (INSTALLER, VERSION_FILE, MANIFEST):
-        if needed not in names:
-            raise UpdateError(f"this archive has no {needed!r}: not a MAKO Renderer archive")
-    return files
-
+# ---------- installing ----------
 
 def _tail(text, lines=4):
     return " / ".join([ln.strip() for ln in (text or "").splitlines() if ln.strip()][-lines:])
 
 
-def install(data, expected, prefix=PREFIX):
-    """Install a Renderer archive with its own installer into `prefix`. Nothing runs
-    unless the whole archive is valid and says it's `expected`; afterwards the installed
-    Renderer must report `expected`. Returns the installer's last words."""
-    try:
-        tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:xz")
-    except (tarfile.TarError, EOFError, OSError) as e:
-        raise UpdateError(f"not a valid .tar.xz: {e}") from None
+def install(archive, expected, extract, prefix=PREFIX):
+    """Install a Renderer archive (a file) with its own installer into `prefix`, unpacked
+    with extract(archive, dest, only_top=…), which raises if the archive isn't valid.
+    Nothing runs unless it holds a Renderer that says it's `expected`; afterwards the
+    installed Renderer must report `expected`. Returns the installer's last words."""
     prefix = Path(prefix)
     work_parent = prefix / "share"
     work_parent.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix=".pescao-mako-update-", dir=work_parent))
+    tmp = Path(tempfile.mkdtemp(prefix=".pescao-mako-update-", dir=work_parent))
     try:
-        with tar:
-            for rel, m in _members(tar):
-                target = work / rel
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with tar.extractfile(m) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                os.chmod(target, 0o755 if m.mode & 0o111 else 0o644)
+        work = tmp / "x"
+        names = set(extract(archive, work, only_top=TOP_DIRS + TOP_FILES))
+        for needed in (INSTALLER, VERSION_FILE, MANIFEST):
+            if needed not in names or not (work / needed).is_file():
+                raise UpdateError(f"this archive has no {needed!r}: not a MAKO Renderer archive")
         version = (work / VERSION_FILE).read_text(errors="replace").strip()
         if version != expected:
             raise UpdateError(f"the archive is MAKO Renderer {version!r}, not {expected!r}")
@@ -302,7 +222,7 @@ def install(data, expected, prefix=PREFIX):
         if run.returncode != 0:
             raise UpdateError(f"MAKO's installer failed: {_tail(run.stderr) or _tail(run.stdout) or run.returncode}")
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
     found = installed([prefix / "share/vulkan/implicit_layer.d"], prefix)
     if not found or found["version"] != expected:
         raise UpdateError(f"installed, but MAKO reports {found and found['version']!r} instead of {expected!r}")

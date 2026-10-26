@@ -64,7 +64,7 @@ class Profiles(unittest.TestCase):
 class PerGame(unittest.TestCase):
     def test_entries_are_numeric_ids_for_steam_and_shortcuts(self):
         self.assertEqual(mako.game_entry("1245620"), "1245620")
-        self.assertEqual(mako.game_entry(3000000001, True), "3000000001")
+        self.assertEqual(mako.game_entry(3000000001), "3000000001")
         for bad in ("../1", "", "Game.exe", "12a"):
             with self.subTest(appid=bad), self.assertRaises(ValueError):
                 mako.game_entry(bad)

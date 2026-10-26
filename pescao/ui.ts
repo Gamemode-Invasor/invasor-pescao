@@ -10,7 +10,6 @@ import { currentGame, defineModule, ui, type FormStore, type ModuleCtx, type Set
 interface Status {
   installed: boolean;
   path: string;
-  exists: boolean;
   error: string | null;
   /** MAKO's own validator complains about the current conf.toml. */
   mako_problem: string | null;
@@ -64,39 +63,19 @@ async function form(ctx: ModuleCtx, name: string, st: FormStore): Promise<Settin
   return f;
 }
 
-const TESTED = "4.6"; // keep in sync with updates.TESTED
-
 /** MAKO's shaders (its bundled vkBasalt) are left out of Pescao for now. */
 const SHADERS_NOTE = "Shaders (MAKO's vkBasalt effects) aren't set up by Pescao for now: use mako-ui for them, and add the variables it shows to the launch option.";
 
-/** Copies text to the clipboard: the Clipboard API, else the older copy command. */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    /* not allowed here: try the old way */
-  }
-  const area = document.createElement("textarea");
-  area.value = text;
-  area.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
-  document.body.append(area);
-  try {
-    area.select();
-    return document.execCommand("copy");
-  } catch {
-    return false;
-  } finally {
-    area.remove();
-  }
-}
+/** The game a launch option is applied to. */
+type GameRef = { appid: string; name?: string | null };
 
 /**
- * The launch option for a profile (as mako-ui builds it) with a Copy button. MAKO uses the
- * profile named by MAKO_PROFILE in it: MAKO 4 doesn't match games by their Steam id.
+ * The launch option for a profile (as mako-ui builds it) with a Copy button and, for a game
+ * when Steam allows it, an Apply button that puts it in the game's launch options. MAKO uses
+ * the profile named by MAKO_PROFILE in it: MAKO 4 doesn't match games by their Steam id.
  */
-async function launchOption(ctx: ModuleCtx, name: string): Promise<HTMLElement[]> {
-  let opt: { line: string; found: boolean };
+async function launchOption(ctx: ModuleCtx, name: string, game?: GameRef): Promise<HTMLElement[]> {
+  let opt: { line: string; found: boolean; can_apply: boolean };
   try {
     opt = await ctx.call("launch_option", { name });
   } catch (e) {
@@ -107,14 +86,45 @@ async function launchOption(ctx: ModuleCtx, name: string): Promise<HTMLElement[]
     ui.button({
       label: "Copy launch option",
       onClick: async () => {
-        if (await copyText(opt.line)) ctx.toast("Copied: paste it in the game's launch options");
+        if (await ctx.copy(opt.line)) ctx.toast("Copied: paste it in the game's launch options");
         else ctx.toast("Couldn't copy here: type it in as shown", "error");
       },
     }),
-    ui.info("Paste it in the game's Properties › General › Launch options; keep your own variables before mako-launch. MAKO only runs, with this profile, in games started this way."),
   ];
+  if (game && opt.can_apply)
+    items.push(
+      ui.button({
+        label: "Apply to this game",
+        onClick: async () => {
+          try {
+            const r = await ctx.call<{ line: string; verified: boolean }>("apply_launch_option", { appid: game.appid, name });
+            ctx.toast(r.verified ? `Applied to ${game.name ?? "the game"}` : "Applied (Steam couldn't confirm it)");
+          } catch (e) {
+            ctx.toast(`Not applied: ${errorText(e)}`, "error");
+          }
+        },
+      }),
+      ui.info("Apply keeps your own launch options: your variables and wrappers stay before mako-launch."),
+    );
+  else
+    items.push(ui.info("Paste it in the game's Properties › General › Launch options; keep your own variables before mako-launch."));
+  items.push(ui.info("MAKO only runs, with this profile, in games started this way."));
   if (!opt.found) items.push(ui.info("⚠ mako-launch isn't there: install MAKO Renderer (Updates tab)."));
   return items;
+}
+
+/** After turning MAKO off for a game: offer to take mako-launch out of its launch options. */
+async function removeLaunchOption(ctx: ModuleCtx, game: GameRef) {
+  try {
+    const opt = await ctx.call<{ can_apply: boolean }>("launch_option", {});
+    if (!opt.can_apply) return;
+    if (!(await ui.confirm(`Also take MAKO (MAKO_PROFILE and mako-launch) out of ${game.name ?? "the game"}'s launch options?`, { ok: "Remove" })))
+      return;
+    const r = await ctx.call<{ line: string; verified: boolean }>("remove_launch_option", { appid: game.appid });
+    ctx.toast(r.verified ? "Removed from its launch options" : "Removed (Steam couldn't confirm it)");
+  } catch (e) {
+    ctx.toast(`Launch options not changed: ${errorText(e)}`, "error");
+  }
 }
 
 /**
@@ -172,7 +182,7 @@ async function renderGame(ctx: ModuleCtx, force = false) {
     status = await ctx.call<Status>("status");
     if (!status.error) {
       profiles = await ctx.call<ProfileInfo[]>("profiles");
-      if (t) current = await ctx.call("game_profile", { appid: t.game.appid, shortcut: t.game.shortcut });
+      if (t) current = await ctx.call("game_profile", { appid: t.game.appid });
     }
   } catch (e) {
     problem = errorText(e);
@@ -194,7 +204,7 @@ async function renderGame(ctx: ModuleCtx, force = false) {
     } else if (current) {
       const game = t.game;
       const cur = current;
-      const args = { appid: game.appid, shortcut: game.shortcut };
+      const args = { appid: game.appid };
       parts.push(
         ui.toggle({
           label: "MAKO Renderer",
@@ -209,6 +219,7 @@ async function renderGame(ctx: ModuleCtx, force = false) {
               } else {
                 await ctx.call("set_game_profile", { ...args, name: null });
                 ctx.toast("Off for this game");
+                await removeLaunchOption(ctx, game);
               }
             } catch (e) {
               ctx.toast(`Couldn't change it: ${errorText(e)}`, "error");
@@ -218,7 +229,7 @@ async function renderGame(ctx: ModuleCtx, force = false) {
         }),
       );
       // Right under the switch, only while it's on: what the game needs to use MAKO.
-      if (cur.profile) parts.push(...(await launchOption(ctx, cur.profile)));
+      if (cur.profile) parts.push(...(await launchOption(ctx, cur.profile, game)));
       if (cur.profile && cur.custom) {
         parts.push(...powerModesNote(ctx, profiles.find((p) => p.name === cur.profile), () => void renderGame(ctx, true)));
         parts.push(await form(ctx, "profile", store(ctx, "profile_get", "profile_set", { name: cur.profile })), ui.info(`ⓘ ${SHADERS_NOTE}`));
@@ -317,7 +328,7 @@ async function renderProfiles(ctx: ModuleCtx, pick?: string) {
         ctx.toast(`Renamed to “${typed()}”`);
         await renderProfiles(ctx, typed());
       }),
-      ui.info("The launch option names the profile (MAKO_PROFILE): after a rename, copy it again for the games that use it."),
+      ui.info("The launch option names the profile (MAKO_PROFILE): after a rename, copy or apply it again for the games that use it."),
       run("Delete this profile", async () => {
         const games = profile.games.length ? ` Its ${profile.games.length} game(s) will go back to no MAKO profile.` : "";
         if (!(await ui.confirm(`Delete the profile “${name}”?${games}`, { ok: "Delete" }))) return;
@@ -382,7 +393,7 @@ export default defineModule({
     },
     {
       label: "Updates",
-      render(el, ctx) {
+      async render(el, ctx) {
         const result = document.createElement("div");
         const check = async () => {
           result.replaceChildren(ui.info("Checking GitHub…"));
@@ -436,8 +447,9 @@ export default defineModule({
             );
           result.replaceChildren(...lines);
         };
+        const tested = await ctx.call<{ tested: string }>("compat").then((c) => c.tested, () => "4.6");
         el.append(
-          ui.info(`This Pescao is tested with MAKO Renderer ${TESTED}.`),
+          ui.info(`This Pescao is tested with MAKO Renderer ${tested}.`),
           ui.info("Stable MAKO Renderer releases from GitHub, installed into ~/.local by MAKO's own installer."),
           ui.button({ label: "Check for updates", onClick: () => void check() }),
           result,
@@ -465,7 +477,7 @@ export default defineModule({
   showInQam: async (ctx) => {
     const running = ctx.game().running;
     if (!running) return true;
-    const r = await ctx.call<{ profile: string | null }>("game_profile", { appid: running.appid, shortcut: running.shortcut });
+    const r = await ctx.call<{ profile: string | null }>("game_profile", { appid: running.appid });
     return r.profile !== null;
   },
   onGameChange: (_game, ctx) => void renderGame(ctx),
