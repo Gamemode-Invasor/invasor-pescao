@@ -150,23 +150,67 @@ class OffAndOn(unittest.TestCase):
 
 
 class MakoUiRules(unittest.TestCase):
-    """The side effects mako-ui (MAKO 4.6) applies when an option changes."""
+    """The side effects mako-ui (MAKO 5.0) applies when an option changes."""
 
     def profile(self, **kw):
         data = {"version": 2, "global": {"allow_fp16": False}, "profile": [{"name": "p", "flow_scale": 0.5, "performance_mode": False, **kw}]}
         return data, data["profile"][0]
 
     def test_ultra_performance_is_a_locking_preset(self):
-        data, p = self.profile(scaling_enabled=True)
-        self.assertEqual(mako.change(data, p, "ultra_performance", True), ["flow_scale", "performance_mode"])
-        self.assertEqual((p["flow_scale"], p["performance_mode"], data["global"]["allow_fp16"]), (0.7, True, False))
-        for key, value in (("flow_scale", 0.9), ("performance_mode", False), ("scaling_method", "mako")):
-            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "Ultra performance"):
-                mako.change(data, p, key, value)
-        mako.change(data, p, "ultra_performance", False)
-        self.assertEqual((p["flow_scale"], p["performance_mode"]), (0.8, False))
-        mako.change(data, p, "flow_scale", 0.9)
-        self.assertEqual(p["flow_scale"], 0.9)
+        for model, ultra_scale in ((None, 0.6), ("mako-fg", 0.6), ("lossless-scaling", 0.7)):
+            with self.subTest(model=model):
+                data, p = self.profile(scaling_enabled=True, **({"frame_generation_model": model} if model else {}))
+                self.assertEqual(mako.change(data, p, "ultra_performance", True), ["flow_scale", "performance_mode"])
+                # performance_mode goes on with either model, as mako-ui does (MAKO FG ignores it).
+                self.assertEqual((p["flow_scale"], p["performance_mode"], data["global"]["allow_fp16"]), (ultra_scale, True, False))
+                for key, value in (("flow_scale", 0.9), ("performance_mode", False), ("scaling_method", "ls1"),
+                                   ("mako_fg_mode", "quality"), ("mako_fg_mode", "balanced")):
+                    with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, "Ultra performance"):
+                        mako.change(data, p, key, value)
+                self.assertNotIn("mako_fg_mode", p)  # MAKO raises it while Ultra is on; the stored one is kept
+                mako.change(data, p, "ultra_performance", False)
+                self.assertEqual((p["flow_scale"], p["performance_mode"]), (0.8, False))
+                mako.change(data, p, "flow_scale", 0.9)
+                mako.change(data, p, "mako_fg_mode", "quality")
+                self.assertEqual((p["flow_scale"], p["mako_fg_mode"]), (0.9, "quality"))
+
+    def test_new_keys_go_in_alphabetical_place_others_stay(self):
+        data, p = self.profile()  # name, flow_scale, performance_mode: not alphabetical (made by hand)
+        mako.change(data, p, "mako_fg_mode", "quality")
+        mako.change(data, p, "adaptive", True)
+        mako.change(data, p, "zzz", 1)
+        self.assertEqual(list(p), ["adaptive", "mako_fg_mode", "name", "flow_scale", "performance_mode", "zzz"])
+        data, p = self.profile(multiplier=2)
+        p = {k: p[k] for k in sorted(p)}
+        mako.change(data, p, "frame_generation_model", "mako-fg")
+        self.assertEqual(list(p), sorted(p))
+
+    def test_the_model_sets_ultra_s_flow_scale(self):
+        data, p = self.profile(ultra_performance=True, flow_scale=0.6, performance_mode=True)
+        self.assertEqual(mako.change(data, p, "frame_generation_model", "lossless-scaling"), ["flow_scale"])
+        self.assertEqual((p["flow_scale"], p["performance_mode"]), (0.7, True))  # LSFG Performance, already on
+        mako.change(data, p, "frame_generation_model", "mako-fg")
+        self.assertEqual(p["flow_scale"], 0.6)
+        self.assertEqual(mako.change(data, p, "mako_fg_mode", "extra-performance"), [])
+        data, p = self.profile(ultra_performance=True, flow_scale=0.6)  # performance_mode false (by hand)
+        self.assertEqual(mako.change(data, p, "frame_generation_model", "lossless-scaling"), ["flow_scale", "performance_mode"])
+        self.assertTrue(p["performance_mode"])  # the file says what shown() shows
+        data, p = self.profile()  # without Ultra the model changes nothing else
+        self.assertEqual(mako.change(data, p, "frame_generation_model", "lossless-scaling"), [])
+        self.assertEqual(p["flow_scale"], 0.5)
+        mako.change(data, p, "performance_mode", True)  # LSFG Quality / Performance: free without Ultra
+        self.assertTrue(p["performance_mode"])
+
+    def test_shown_as_mako_uses_it(self):
+        values = {"ultra_performance": False, "flow_scale": 0.5, "performance_mode": False, "mako_fg_mode": "quality",
+                  "frame_generation_model": "mako-fg", "scaling_enabled": True, "scaling_method": "ls1"}
+        self.assertEqual(mako.shown(values), values)
+        ultra = {**values, "ultra_performance": True}
+        self.assertEqual(mako.shown(ultra), {**ultra, "flow_scale": 0.6, "performance_mode": True, "mako_fg_mode": "performance",
+                                             "scaling_method": "mako"})
+        lsfg = {**ultra, "frame_generation_model": "lossless-scaling", "mako_fg_mode": "extra-performance", "scaling_enabled": False}
+        self.assertEqual(mako.shown(lsfg), {**lsfg, "flow_scale": 0.7, "performance_mode": True})
+        self.assertEqual(ultra["mako_fg_mode"], "quality")  # not changed in place
 
     def test_scaling_method_is_free_without_scaling(self):
         data, p = self.profile(ultra_performance=True, scaling_enabled=False)

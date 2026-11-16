@@ -25,11 +25,13 @@ interface ProfileInfo {
 const errorText = (e: unknown) => String((e as Error)?.message ?? e);
 
 // Forms on screen. Some options change others, as in mako-ui (e.g. Ultra performance sets
-// flow scale and the lighter model; keep in sync with mako.change): after saving one
+// flow scale, LSFG Performance, at least the Performance MAKO FG mode and MAKO Scaler, and the
+// model picks Ultra's flow scale; keep in sync with mako.change and mako.shown): after saving one
 // of those, every form shows what's stored. Other saves don't reload (a held slider would jump).
 const forms = new Set<SettingsForm>();
 const CHANGES_OTHERS = new Set([
   "ultra_performance",
+  "frame_generation_model",
   "dynamic_cadence_recovery",
   "base_fps_cap",
   "adaptive_auto_base_fps_cap",
@@ -72,7 +74,7 @@ type GameRef = { appid: string; name?: string | null };
 /**
  * The launch option for a profile (as mako-ui builds it) with a Copy button and, for a game
  * when Steam allows it, an Apply button that puts it in the game's launch options. MAKO uses
- * the profile named by MAKO_PROFILE in it: MAKO 4 doesn't match games by their Steam id.
+ * the profile named by MAKO_PROFILE in it: MAKO doesn't match games by their Steam id.
  */
 async function launchOption(ctx: ModuleCtx, name: string, game?: GameRef): Promise<HTMLElement[]> {
   let opt: { line: string; found: boolean; can_apply: boolean };
@@ -152,17 +154,22 @@ function powerModesNote(ctx: ModuleCtx, profile: ProfileInfo | undefined, done: 
   ];
 }
 
-/** A note when the installed MAKO isn't the series Pescao was tested with. */
-async function compatNote(ctx: ModuleCtx): Promise<HTMLElement[]> {
+/**
+ * A note when the installed MAKO isn't the series Pescao was tested with. `blocked`: it's an
+ * older series (MAKO 4), whose profiles this Pescao doesn't edit (the backend refuses to).
+ */
+async function compatNote(ctx: ModuleCtx): Promise<{ notes: HTMLElement[]; blocked: boolean }> {
   try {
-    const c = await ctx.call<{ installed: string | null; compat: string | null; tested: string }>("compat");
+    const c = await ctx.call<{ installed: string | null; compat: string | null; tested: string; blocked: string | null }>("compat");
+    if (c.blocked) return { notes: [ui.info(`⚠ ${c.blocked}`)], blocked: true };
     if (c.compat === "newer_minor" || c.compat === "unsupported")
-      return [ui.info(`⚠ MAKO ${c.installed} is newer than what Pescao was tested with (${c.tested}): some options may be missing.`)];
-    if (c.compat === "older") return [ui.info(`⚠ MAKO ${c.installed} is older than what Pescao was tested with (${c.tested}).`)];
+      return { notes: [ui.info(`⚠ MAKO ${c.installed} is newer than what Pescao was tested with (${c.tested}): some options may be missing.`)], blocked: false };
+    if (c.compat === "older")
+      return { notes: [ui.info(`⚠ MAKO ${c.installed} is older than what Pescao was tested with (${c.tested}).`)], blocked: false };
   } catch {
     /* not essential */
   }
-  return [];
+  return { notes: [], blocked: false };
 }
 
 // ---------- Game ----------
@@ -187,11 +194,17 @@ async function renderGame(ctx: ModuleCtx, force = false) {
   } catch (e) {
     problem = errorText(e);
   }
-  const sig = JSON.stringify([t?.game.appid, t?.how, status, profiles.map((p) => [p.name, p.power_modes]), current, problem]);
+  const compat = await compatNote(ctx);
+  const sig = JSON.stringify([t?.game.appid, t?.how, status, profiles.map((p) => [p.name, p.power_modes]), current, problem, compat.blocked]);
   if (!force && sig === gameSig) return; // nothing changed: keep the ring where it is
   gameSig = sig;
 
-  const parts: HTMLElement[] = await compatNote(ctx);
+  const parts: HTMLElement[] = [...compat.notes];
+  if (compat.blocked) {
+    // MAKO 4: nothing to edit here until MAKO is updated (Updates tab).
+    el.replaceChildren(...parts);
+    return;
+  }
   if (status && !status.installed) parts.push(ui.info("MAKO Renderer doesn't seem to be installed (no Vulkan layer found)."));
   if (status?.error) parts.push(ui.info(status.error));
   if (!t) {
@@ -345,9 +358,52 @@ async function renderProfiles(ctx: ModuleCtx, pick?: string) {
   gameSig = ""; // the Game tab's list of profiles may have changed
 }
 
-// ---------- module ----------
+/** mako-launch's own options (launcher.conf), for every game. */
+async function launcherSection(ctx: ModuleCtx): Promise<HTMLElement> {
+  let body: HTMLElement[];
+  try {
+    body = [await form(ctx, "launcher", store(ctx, "launcher_get", "launcher_set"))];
+  } catch (e) {
+    body = [ui.info(errorText(e))];
+  }
+  return ui.section("Launcher (all games)", body, { open: false });
+}
+
+// ---------- Manage ----------
 
 let skipShow = false; // a tab's first onShow comes right after its render
+let manageEl: HTMLElement | null = null;
+let manageBlocked = false; // Manage shows only the MAKO 4 note (compatNote)
+
+async function renderManage(el: HTMLElement, ctx: ModuleCtx) {
+  manageEl = el;
+  const globalEl = document.createElement("div");
+  const compat = await compatNote(ctx);
+  el.replaceChildren(...compat.notes);
+  manageBlocked = compat.blocked;
+  if (compat.blocked) {
+    // MAKO 4: no profiles or global options until MAKO is updated (Updates tab).
+    // mako-launch's own options are the same in MAKO 4 and 5.
+    el.append(await launcherSection(ctx));
+    return;
+  }
+  profilesEl = document.createElement("div");
+  el.append(profilesEl, globalEl);
+  await renderProfiles(ctx);
+  try {
+    const status = await ctx.call<Status>("status");
+    const body: HTMLElement[] = [ui.info(`Config: ${status.path}`)];
+    if (status.mako_problem) el.prepend(ui.info(`⚠ MAKO reports a problem in conf.toml: ${status.mako_problem}`));
+    if (status.error) body.push(ui.info(status.error));
+    else body.push(await form(ctx, "global", store(ctx, "global_get", "global_set")));
+    globalEl.append(ui.section("Global options", body, { open: false }));
+    globalEl.append(await launcherSection(ctx));
+  } catch (e) {
+    globalEl.append(ui.info(errorText(e)));
+  }
+}
+
+// ---------- module ----------
 
 export default defineModule({
   tabs: [
@@ -361,33 +417,14 @@ export default defineModule({
     },
     {
       label: "Manage",
-      async render(el, ctx) {
-        const globalEl = document.createElement("div");
-        profilesEl = document.createElement("div");
-        el.append(...(await compatNote(ctx)), profilesEl, globalEl);
+      render: (el, ctx) => {
         skipShow = true;
-        await renderProfiles(ctx);
-        try {
-          const status = await ctx.call<Status>("status");
-          const body: HTMLElement[] = [ui.info(`Config: ${status.path}`)];
-          if (status.mako_problem) el.prepend(ui.info(`⚠ MAKO reports a problem in conf.toml: ${status.mako_problem}`));
-          if (status.error) body.push(ui.info(status.error));
-          else body.push(await form(ctx, "global", store(ctx, "global_get", "global_set")));
-          globalEl.append(ui.section("Global options", body, { open: false }));
-          let launcherBody: HTMLElement[];
-          try {
-            launcherBody = [await form(ctx, "launcher", store(ctx, "launcher_get", "launcher_set"))];
-          } catch (e) {
-            launcherBody = [ui.info(errorText(e))];
-          }
-          globalEl.append(ui.section("Launcher (all games)", launcherBody, { open: false }));
-        } catch (e) {
-          globalEl.append(ui.info(errorText(e)));
-        }
+        return renderManage(el, ctx);
       },
       // Another tool (mako-ui) may have changed the file meanwhile.
       onShow: (ctx) => {
         if (skipShow) skipShow = false;
+        else if (manageBlocked && manageEl) void renderManage(manageEl, ctx); // MAKO may have been updated meanwhile
         else void renderProfiles(ctx);
       },
     },
@@ -447,7 +484,7 @@ export default defineModule({
             );
           result.replaceChildren(...lines);
         };
-        const tested = await ctx.call<{ tested: string }>("compat").then((c) => c.tested, () => "4.6");
+        const tested = await ctx.call<{ tested: string }>("compat").then((c) => c.tested, () => "5.0");
         el.append(
           ui.info(`This Pescao is tested with MAKO Renderer ${tested}.`),
           ui.info("Stable MAKO Renderer releases from GitHub, installed into ~/.local by MAKO's own installer."),
@@ -462,9 +499,9 @@ export default defineModule({
         el.append(
           ui.info("Pescao is a panel for MAKO Renderer: frame generation, scaling and shaders on Linux (github.com/eugeniosegala/MAKO)."),
           ui.separator(),
-          ui.info("Thanks to Eugenio Segala and every MAKO contributor."),
+          ui.info("Thanks to Eugenio Segala and every MAKO contributor, for MAKO and its own frame generation, MAKO FG."),
           ui.info("Thanks to PancakeTAS and the lsfg-vk contributors, the project MAKO comes from."),
-          ui.info("Thanks to THS, the developer of Lossless Scaling, whose frame generation MAKO uses (you need your own copy of Lossless Scaling)."),
+          ui.info("Thanks to THS, the developer of Lossless Scaling, whose frame generation (LSFG) and LS1 scaling MAKO can use (you need your own copy of Lossless Scaling for them; MAKO FG and MAKO Scaler don't need it)."),
           ui.separator(),
           ui.info("Pescao is not affiliated with MAKO, lsfg-vk or Lossless Scaling. Please don't report problems with this module to them."),
         );
@@ -482,7 +519,8 @@ export default defineModule({
   },
   onGameChange: (_game, ctx) => void renderGame(ctx),
   destroy: () => {
-    gameEl = profilesEl = null;
+    gameEl = profilesEl = manageEl = null;
+    manageBlocked = false;
     forms.clear();
     gameSig = "";
     selected = null;
