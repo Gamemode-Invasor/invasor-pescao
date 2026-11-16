@@ -78,8 +78,8 @@ class Versions(unittest.TestCase):
         self.assertEqual(updates.compare(None, "4.1.0"), "newer_available")
 
     def test_compatibility(self):
-        cases = {"4.6.0": "tested", "4.6.3": "tested", "4.7.0": "newer_minor", "4.0.0": "older", "3.3.0": "unsupported",
-                 "5.0.0": "unsupported", None: None}
+        cases = {"5.0.0": "tested", "5.0.3": "tested", "5.0.0-rc1": "tested", "5.1.0": "newer_minor", "4.6.0": "unsupported",
+                 "4.0.0": "unsupported", "6.0.0": "unsupported", None: None}
         for version, expected in cases.items():
             with self.subTest(version=version):
                 self.assertEqual(updates.compatibility(version), expected)

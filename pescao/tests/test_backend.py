@@ -141,6 +141,8 @@ class Backend(unittest.TestCase):
         self.ctx = FakeCtx()
         self.b.setup(self.ctx)
         self.b.updates.PREFIX = Path(d.name) / ".local"
+        # The MAKO this Pescao is for; never the one installed on the machine running the tests.
+        self.b.updates.installed = lambda: {"version": "5.0.0", "path": "/x", "local": True, "owner": "standalone"}
 
     def file(self):
         return tomllib.loads(self.path.read_text())
@@ -191,10 +193,46 @@ class Backend(unittest.TestCase):
         self.b.profile_set("default", "ultra_performance", True)
         p = self.file()["profile"][0]
         # Since MAKO 4.5 FP16 is only the global choice: Ultra leaves it alone.
-        self.assertEqual((p["flow_scale"], p["performance_mode"], self.file()["global"]["allow_fp16"]), (0.7, True, False))
+        # No frame_generation_model: MAKO FG, as MAKO 5.0 reads it, so Ultra's flow scale is 0.6.
+        self.assertEqual((p["flow_scale"], p["performance_mode"], self.file()["global"]["allow_fp16"]), (0.6, True, False))
         with self.assertRaisesRegex(schema.InvalidArgument, "Ultra performance"):
             self.b.profile_set("default", "flow_scale", 0.9)
-        self.assertEqual(self.b.profile_get("default")["flow_scale"], 0.7)
+        self.assertEqual(self.b.profile_get("default")["flow_scale"], 0.6)
+        self.assertEqual(self.b.profile_set("default", "frame_generation_model", "lossless-scaling"), "lossless-scaling")
+        self.assertEqual(self.file()["profile"][0]["flow_scale"], 0.7)
+        self.b.profile_set("default", "frame_generation_model", "mako-fg")
+        # Ultra uses at least the Performance MAKO FG mode: shown that way, the stored one kept (as mako-ui does).
+        self.assertEqual(self.b.profile_get("default")["mako_fg_mode"], "performance")
+        self.assertNotIn("mako_fg_mode", self.file()["profile"][0])
+        with self.assertRaisesRegex(schema.InvalidArgument, "Ultra performance"):
+            self.b.profile_set("default", "mako_fg_mode", "quality")
+        self.assertEqual(self.b.profile_set("default", "mako_fg_mode", "extra-performance"), "extra-performance")
+        self.b.profile_set("default", "ultra_performance", False)
+        p = self.file()["profile"][0]
+        self.assertEqual((p["flow_scale"], p["performance_mode"], p["mako_fg_mode"]), (0.8, False, "extra-performance"))
+
+    def test_mako_5_options(self):
+        # A profile from before MAKO 5.0 shows MAKO's defaults for what it lacks.
+        got = self.b.profile_get("default")
+        self.assertEqual((got["frame_generation_model"], got["mako_fg_mode"], got["mailbox_presentation_compatibility"],
+                          got["scaling_method"]), ("mako-fg", "balanced", False, "mako"))
+        for key, value in (("frame_generation_model", "lossless-scaling"), ("mako_fg_mode", "quality"),
+                           ("mailbox_presentation_compatibility", True), ("performance_mode", False)):
+            self.assertEqual(self.b.profile_set("default", key, value), value)
+        for key, value in (("frame_generation_model", "lsfg"), ("frame_generation_model", True), ("mako_fg_mode", "fast"),
+                           ("mailbox_presentation_compatibility", "yes")):
+            with self.subTest(key=key, value=value), self.assertRaises(schema.InvalidArgument):
+                self.b.profile_set("default", key, value)
+        text = self.path.read_text()
+        for line in ('frame_generation_model = "lossless-scaling"', 'mako_fg_mode = "quality"', "mailbox_presentation_compatibility = true",
+                     "performance_mode = false", 'unknown_future_key = "kept"'):
+            self.assertIn(line, text)
+        p = self.file()["profile"][0]
+        self.assertEqual(list(p), sorted(p))  # still alphabetical, as mako-ui writes it
+        self.b.profile_create("copy", copy_from="default")
+        copy = self.file()["profile"][1]
+        self.assertEqual((copy["frame_generation_model"], copy["mako_fg_mode"], copy["mailbox_presentation_compatibility"]),
+                         ("lossless-scaling", "quality", True))
 
     def test_global(self):
         self.assertEqual(self.b.global_get(), {"allow_fp16": True, "dll": ""})
@@ -222,7 +260,7 @@ class Backend(unittest.TestCase):
             self.b.profiles()
 
     def test_new_profiles_match_mako_ui(self):
-        # A profile as mako-ui creates it (MAKO 4.6.0), keys in its order.
+        # A profile as mako-ui creates it (MAKO 5.0.0), keys in its order.
         mako_ui = tomllib.loads("""[[profile]]
 adaptive = false
 adaptive_auto_base_fps_cap = false
@@ -235,18 +273,21 @@ dynamic_cadence_probe_interval_seconds = 2.0
 dynamic_cadence_recovery = false
 flow_scale = 0.8
 frame_generation_enabled = true
+frame_generation_model = "mako-fg"
 frame_generation_provisioned = true
 frame_generation_refresh_threshold = 0
 gamescope_vrr_mode = "follow-steam"
 gpu_headroom_percent = 0
 hdr_quality = "performance"
+mailbox_presentation_compatibility = false
+mako_fg_mode = "balanced"
 multiplier = 2
 name = "nuevo"
 pacing = "none"
 performance_mode = false
 scaling_enabled = false
 scaling_factor = 1.5
-scaling_method = "ls1"
+scaling_method = "mako"
 scaling_sharpness = 0.8
 scaling_supersampling = false
 swapchain_image_count_compatibility = false
@@ -269,14 +310,14 @@ ultra_performance = false
     def test_updates_only_install_when_newer(self):
         u = self.b.updates
         calls = []
-        self.ctx.http.releases = github("4.1.0")
+        self.ctx.http.releases = github("5.1.0")
         u.install = lambda archive, expected, extract: calls.append((Path(archive).read_bytes(), expected)) or "done"
         mine = {"path": "/x", "local": True, "owner": "standalone"}
-        for have, state in ((None, "not_installed"), ({**mine, "version": "4.1.0"}, "up_to_date"),
-                            ({**mine, "version": "4.2.0"}, "ahead"),
-                            ({**mine, "version": "4.0.0", "owner": "decky"}, "decky"),
-                            ({**mine, "version": "4.0.0", "local": False}, "system"),
-                            ({**mine, "version": "4.0.0"}, "newer_available")):
+        for have, state in ((None, "not_installed"), ({**mine, "version": "5.1.0"}, "up_to_date"),
+                            ({**mine, "version": "5.2.0"}, "ahead"),
+                            ({**mine, "version": "5.0.0", "owner": "decky"}, "decky"),
+                            ({**mine, "version": "5.0.0", "local": False}, "system"),
+                            ({**mine, "version": "5.0.0"}, "newer_available")):
             u.installed = lambda have=have: have
             with self.subTest(state=state):
                 self.assertEqual(self.b.update_status()["state"], state)
@@ -284,18 +325,18 @@ ultra_performance = false
                     with self.assertRaises(schema.InvalidArgument):
                         self.b.update_install()
                 else:
-                    self.assertEqual(self.b.update_install(), {"installed": "4.1.0"})
-        self.assertEqual(calls, [(b"tarball", "4.1.0")] * 2)
-        name = "MAKO-Renderer-v4.1.0-linux.tar.xz"
-        url = f"https://github.com/eugeniosegala/MAKO/releases/download/render-v4.1.0/{name}"
+                    self.assertEqual(self.b.update_install(), {"installed": "5.1.0"})
+        self.assertEqual(calls, [(b"tarball", "5.1.0")] * 2)
+        name = "MAKO-Renderer-v5.1.0-linux.tar.xz"
+        url = f"https://github.com/eugeniosegala/MAKO/releases/download/render-v5.1.0/{name}"
         self.assertEqual([c[:3] for c in self.ctx.http.calls], [(url, name, ("sha256", "ab" * 32))] * 2)  # checked: no question
         self.assertEqual([c[3] for c in self.ctx.http.calls], self.ctx.tasks)
-        self.assertEqual(self.ctx.tasks[0].label, "Updating MAKO Renderer to 4.1.0")
+        self.assertEqual(self.ctx.tasks[0].label, "Updating MAKO Renderer to 5.1.0")
         self.assertEqual(list((u.PREFIX / "share").iterdir()), [])  # the download is removed
 
     def test_without_github_s_checksum_invasor_asks(self):
         u = self.b.updates
-        self.ctx.http.releases = github("4.1.0", sha256=None)
+        self.ctx.http.releases = github("5.1.0", sha256=None)
         u.installed = lambda: None
         u.install = lambda *a: self.fail("must not install")
         self.ctx.http.deny = schema.Unavailable("the download wasn't allowed")
@@ -305,13 +346,44 @@ ultra_performance = false
 
     def test_a_new_major_version_is_never_installed(self):
         u = self.b.updates
-        self.ctx.http.releases = github("5.0.0")
-        u.installed = lambda: {"version": "4.6.0", "path": "/x", "local": True, "owner": "standalone"}
+        self.ctx.http.releases = github("6.0.0")
+        u.installed = lambda: {"version": "5.0.0", "path": "/x", "local": True, "owner": "standalone"}
         st = self.b.update_status()
         self.assertEqual((st["state"], st["latest_compat"], st["installed_compat"]), ("newer_available", "unsupported", "tested"))
         with self.assertRaisesRegex(schema.InvalidArgument, "new major version"):
             self.b.update_install()
         self.assertEqual(self.ctx.http.calls, [])
+
+    def test_an_older_major_version_is_not_edited_but_updated(self):
+        # MAKO 4.x: profiles aren't written with MAKO 5's options (Pescao 0.3.x is for it), but 5.0 installs over it.
+        u = self.b.updates
+        self.ctx.http.releases = github("5.0.0")
+        u.installed = lambda: {"version": "4.6.0", "path": "/x", "local": True, "owner": "standalone"}
+        u.install = lambda archive, expected, extract: "done"
+        c = self.b.compat()
+        self.assertEqual((c["installed"], c["compat"], c["tested"]), ("4.6.0", "unsupported", "5.0"))
+        self.assertRegex(c["blocked"], r"MAKO 4\.6\.0 is from an older series: this Pescao needs MAKO 5\.x.*Pescao 0\.3\.x")
+        before = self.path.read_text()
+        for call, args in (("profile_set", ("default", "multiplier", 3)), ("profile_create", ("new",)), ("make_custom", ("2000",)),
+                           ("set_game_profile", ("1000", None)), ("global_set", ("allow_fp16", False)), ("profile_delete", ("default",))):
+            with self.subTest(call=call), self.assertRaisesRegex(schema.Unavailable, "older series"):
+                getattr(self.b, call)(*args)
+        self.assertEqual(self.path.read_text(), before)  # never written
+        self.assertEqual(self.b.profiles()[0]["name"], "default")  # reading still works
+        st = self.b.update_status()
+        self.assertEqual((st["state"], st["latest_compat"], st["installed_compat"]), ("newer_available", "tested", "unsupported"))
+        self.assertEqual(self.b.update_install(), {"installed": "5.0.0"})
+        u.installed = lambda: {"version": "5.0.0", "path": "/x", "local": True, "owner": "standalone"}
+        self.assertIsNone(self.b.compat()["blocked"])
+        self.assertEqual(self.b.profile_set("default", "multiplier", 3), 3)
+
+    def test_newer_unknown_or_missing_mako_is_not_blocked(self):
+        for have in (None, {"version": None, "path": "/x", "local": True, "owner": None},
+                     {"version": "6.0.0", "path": "/x", "local": True, "owner": "standalone"}):
+            self.b.updates.installed = lambda have=have: have
+            with self.subTest(have=have):
+                self.assertIsNone(self.b.compat()["blocked"])
+                self.assertEqual(self.b.profile_set("default", "multiplier", 4), 4)
 
     def test_launch_option_like_mako_ui(self):
         self.assertEqual(self.b.launch_option("default")["line"], "MAKO_PROFILE='default' ~/.local/bin/mako-launch %command%")

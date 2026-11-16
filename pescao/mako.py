@@ -5,6 +5,9 @@ on its own (tests/test_mako.py).
     version = 2
     [global]            allow_fp16, dll (optional)
     [[profile]]         name, active_in = ["<steam appid>", "Game.exe", …], multiplier, …
+                        (MAKO 5.0 added frame_generation_model, mako_fg_mode and
+                        mailbox_presentation_compatibility; MAKO uses its defaults
+                        for those a profile doesn't have, and so does Pescao.)
     [profile.handheld]  optional (MAKO 4.5+, set in mako-ui), with [profile.docked]: the
     [profile.docked]    profile's options on battery and on AC. Pescao edits one general
                         set of options, so it only offers to remove these (unify).
@@ -126,26 +129,61 @@ def set_value(profile, key, value):
     if key in OPTIONAL_TEXT and value == "":
         profile.pop(key, None)  # empty = let MAKO choose the GPU
     else:
+        _put(profile, key, value)
+
+
+def _put(profile, key, value):
+    """profile[key] = value; a key the profile didn't have (one MAKO 5 added, say) goes
+    before the first key that sorts after it, which is where mako-ui writes it in an
+    alphabetical profile. The other keys keep their order."""
+    if key in profile:
         profile[key] = value
+        return
+    items = list(profile.items())
+    at = next((i for i, (k, _) in enumerate(items) if k > key), len(items))
+    items.insert(at, (key, value))
+    profile.clear()
+    profile.update(items)
 
 
 # Ultra performance is a preset: it sets these and locks them while it's on (as mako-ui does).
-ULTRA_FLOW_SCALE = 0.7
+# Its flow scale depends on the frame generation model: MAKO FG 0.6, LSFG 0.7.
+ULTRA_FLOW_SCALE = {"mako-fg": 0.6, "lossless-scaling": 0.7}
 DEFAULT_FLOW_SCALE = 0.8
+# The model MAKO uses for a profile without frame_generation_model (made before MAKO 5.0).
+DEFAULT_MODEL = "mako-fg"
+# MAKO FG modes, lightest last; Ultra performance uses at least "performance".
+FG_MODES = ("quality", "balanced", "performance", "extra-performance")
+ULTRA_FG_MODES = FG_MODES[2:]
+
+
+def ultra_flow_scale(profile):
+    return ULTRA_FLOW_SCALE.get(profile.get("frame_generation_model", DEFAULT_MODEL), ULTRA_FLOW_SCALE[DEFAULT_MODEL])
 
 
 def change(data, profile, key, value):
-    """Set one profile option with the side effects mako-ui (MAKO 4.6) applies, so a
+    """Set one profile option with the side effects mako-ui (MAKO 5.0) applies, so a
     profile edited here ends up as mako-ui would leave it. ValueError if the option is
     locked by another one. Returns the keys changed besides `key`."""
     also = {}
-    if key in ("flow_scale", "performance_mode") and profile.get("ultra_performance"):
+    ultra = profile.get("ultra_performance")
+    if key in ("flow_scale", "performance_mode") and ultra:
         raise ValueError(f"{key} is set by Ultra performance: turn that off first")
-    if key == "scaling_method" and profile.get("ultra_performance") and profile.get("scaling_enabled"):
-        raise ValueError("the scaling method is set by Ultra performance: turn that off first")
+    if key == "scaling_method" and ultra and profile.get("scaling_enabled"):
+        raise ValueError("the scaling method is set by Ultra performance (MAKO Scaler): turn that off first")
+    if key == "mako_fg_mode" and ultra and value not in ULTRA_FG_MODES:
+        raise ValueError("Ultra performance uses the Performance or Extra performance MAKO FG mode: turn it off first")
     if key == "ultra_performance":
         # FP16 stays the global choice (allow_fp16): since MAKO 4.5 the preset doesn't touch it.
-        also = {"flow_scale": ULTRA_FLOW_SCALE if value else DEFAULT_FLOW_SCALE, "performance_mode": bool(value)}
+        # mako-ui turns performance_mode on with either model (MAKO FG ignores it), so a switch
+        # to LSFG while Ultra is on finds LSFG Performance already set. mako_fg_mode stays as it
+        # is: MAKO raises it to Performance while Ultra is on (shown()).
+        also = {"flow_scale": ultra_flow_scale({**profile, key: value}) if value else DEFAULT_FLOW_SCALE,
+                "performance_mode": bool(value)}
+    elif key == "frame_generation_model" and ultra:
+        also = {"flow_scale": ultra_flow_scale({**profile, key: value})}
+        if profile.get("performance_mode") is not True:
+            also["performance_mode"] = True  # as shown(): Ultra means LSFG Performance
     elif key == "dynamic_cadence_recovery" and value:
         # Recovery rechecks the native cadence: real-frame caps would fight it.
         also = {"adaptive_auto_base_fps_cap": False, "adaptive_fractional_real_frame_priority": "auto", "base_fps_cap": 0,
@@ -155,8 +193,22 @@ def change(data, profile, key, value):
         also = {"dynamic_cadence_recovery": False}
     set_value(profile, key, value)
     for k, v in also.items():
-        profile[k] = v
+        _put(profile, k, v)
     return sorted(also)
+
+
+def shown(values):
+    """A profile's options (all of them, defaults filled in) as MAKO uses them, which is how
+    mako-ui shows them: while Ultra performance is on, its flow scale, LSFG Performance, at
+    least the Performance MAKO FG mode and, with scaling on, MAKO Scaler. Nothing is written."""
+    if not values.get("ultra_performance"):
+        return values
+    out = {**values, "flow_scale": ultra_flow_scale(values), "performance_mode": True}
+    if out.get("mako_fg_mode") not in ULTRA_FG_MODES:
+        out["mako_fg_mode"] = ULTRA_FG_MODES[0]
+    if out.get("scaling_enabled"):
+        out["scaling_method"] = "mako"
+    return out
 
 
 def set_global(data, key, value):

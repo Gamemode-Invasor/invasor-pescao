@@ -7,7 +7,7 @@ the release list and downloads with ctx.http (checked against the sha256 GitHub 
 file), and unpacks with the `extract` it passes in (ctx.archive.extract).
 
 - What's installed is read from MAKO itself: its layer library carries its version as
-  a string ("4.0.0"), and ~/.local/share/mako-render/active-renderer.json (written by
+  a string ("5.0.0"), and ~/.local/share/mako-render/active-renderer.json (written by
   both of MAKO's installers) says who owns it, "standalone" or "decky". A Renderer
   managed by MAKO Decky (or installed outside ~/.local) is never touched.
 - Releases: GitHub's release list for eugeniosegala/MAKO. Renderer releases are tagged
@@ -56,9 +56,11 @@ VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?")
 EMBEDDED = re.compile(rb"(?<![\w.-])(\d{1,3}\.\d{1,3}\.\d{1,3}(?:-[0-9A-Za-z.]{1,20})?)\x00")
 
 # The MAKO series this Pescao was written and tested against. Same major, newer minor:
-# usable (new options just don't show here). Another major: never installed by Pescao.
-TESTED = (4, 6)
-SUPPORTED_MAJOR = 4
+# usable (new options just don't show here). A newer major: never installed by Pescao. An
+# older major (4.x): profiles aren't edited (Pescao 0.3.x is the last for MAKO 4), but it
+# can be updated from here.
+TESTED = (5, 0)
+SUPPORTED_MAJOR = 5
 
 
 class UpdateError(Exception):
@@ -85,6 +87,12 @@ def compatibility(version):
     if (v[0], v[1]) == TESTED:
         return "tested"
     return "newer_minor" if (v[0], v[1]) > TESTED else "older"
+
+
+def older_major(version):
+    """The version is of an older MAKO series than this Pescao needs (4.x); False if unknown."""
+    v = parse_version(version)
+    return v is not None and v[0] < SUPPORTED_MAJOR
 
 
 def compare(installed, latest):

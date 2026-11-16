@@ -30,6 +30,69 @@
             }
           },
           {
+            "key": "frame_generation_model",
+            "type": "select",
+            "label": "Model",
+            "default": "mako-fg",
+            "options": [
+              {
+                "value": "mako-fg",
+                "label": "MAKO FG"
+              },
+              {
+                "value": "lossless-scaling",
+                "label": "LSFG (Lossless Scaling)"
+              }
+            ],
+            "hint": "MAKO FG is MAKO's own and needs nothing else. LSFG is Lossless Scaling's and needs your own copy of it (Lossless.dll); MAKO falls back to MAKO FG if it can't load it. Applies on the next launch.",
+            "when": {
+              "frame_generation_provisioned": true
+            }
+          },
+          {
+            "key": "mako_fg_mode",
+            "type": "select",
+            "label": "MAKO FG mode",
+            "default": "balanced",
+            "options": [
+              {
+                "value": "quality",
+                "label": "Quality"
+              },
+              {
+                "value": "balanced",
+                "label": "Balanced"
+              },
+              {
+                "value": "performance",
+                "label": "Performance"
+              },
+              {
+                "value": "extra-performance",
+                "label": "Extra performance"
+              }
+            ],
+            "hint": "How often motion is solved: every real frame pair (Quality), one in two (Balanced), one in three (Performance) or one in four (Extra performance). Lighter modes save GPU time but can show more artifacts in fast motion. With Ultra performance on, only Performance and Extra performance. Applies live.",
+            "when": {
+              "frame_generation_provisioned": true,
+              "frame_generation_model": "mako-fg"
+            }
+          },
+          {
+            "key": "performance_mode",
+            "type": "toggle",
+            "label": "LSFG Performance",
+            "default": false,
+            "hint": "On: LSFG Performance, the lighter Lossless Scaling model (less GPU work, can add ghosting). Off: LSFG Quality. Set by Ultra performance while that's on. Applies live.",
+            "when": {
+              "frame_generation_provisioned": true,
+              "frame_generation_model": "lossless-scaling"
+            },
+            "disabled_when": {
+              "ultra_performance": true
+            }
+          },
+          {
             "key": "adaptive",
             "type": "toggle",
             "label": "Adaptive",
@@ -193,11 +256,15 @@
             "key": "scaling_method",
             "type": "select",
             "label": "Method",
-            "default": "ls1",
+            "default": "mako",
             "when": {
               "scaling_enabled": true
             },
             "options": [
+              {
+                "value": "mako",
+                "label": "MAKO Scaler"
+              },
               {
                 "value": "ls1",
                 "label": "LS1"
@@ -207,15 +274,11 @@
                 "label": "LS1 Performance"
               },
               {
-                "value": "mako",
-                "label": "MAKO Scaler"
-              },
-              {
                 "value": "native",
                 "label": "Native resolution"
               }
             ],
-            "hint": "LS1 needs Lossless.dll (falls back to MAKO Scaler if it fails); MAKO Scaler doesn't. Ultra performance uses LS1 Performance.",
+            "hint": "MAKO Scaler needs nothing else. LS1 needs Lossless.dll (falls back to MAKO Scaler if it fails). Ultra performance uses MAKO Scaler. Applies live.",
             "disabled_when": {
               "ultra_performance": true
             }
@@ -274,20 +337,7 @@
             "max": 1,
             "step": 0.05,
             "default": 0.8,
-            "hint": "Resolution used to estimate motion. Lower is lighter on the GPU but less precise.",
-            "when": {
-              "frame_generation_provisioned": true
-            },
-            "disabled_when": {
-              "ultra_performance": true
-            }
-          },
-          {
-            "key": "performance_mode",
-            "type": "toggle",
-            "label": "Lighter model",
-            "default": false,
-            "hint": "Uses the lighter frame generation model: faster, slightly lower quality.",
+            "hint": "Resolution used to estimate motion. Lower is lighter on the GPU but less precise. Applies live.",
             "when": {
               "frame_generation_provisioned": true
             },
@@ -300,7 +350,7 @@
             "type": "toggle",
             "label": "Ultra performance",
             "default": false,
-            "hint": "A preset: flow scale 0.7 and the lighter model (and LS1 Performance when scaling), locked while it's on. FP16 follows the global Allow FP16. Turning it off puts flow scale back to 0.8. Applies on the next launch."
+            "hint": "A preset, locked while it's on: flow scale 0.6 and at least the Performance mode with MAKO FG, flow scale 0.7 and LSFG Performance with LSFG, and MAKO Scaler when scaling. FP16 follows the global Allow FP16. Turning it off puts flow scale back to 0.8 and LSFG Quality. Applies on the next launch."
           },
           {
             "key": "gpu_headroom_percent",
@@ -415,6 +465,13 @@
             "label": "Game swapchain images",
             "default": false,
             "hint": "Keeps the game's own swapchain image count. Only for games that won't start otherwise. Applies on the next launch."
+          },
+          {
+            "key": "mailbox_presentation_compatibility",
+            "type": "toggle",
+            "label": "Mailbox presentation",
+            "default": false,
+            "hint": "Presents generated frames through mailbox instead of FIFO. Only for games that hang or fail with frame generation: a newer frame can replace a generated one, so smoothness and pacing may suffer. Applies on the next launch."
           }
         ]
       }
@@ -425,7 +482,7 @@
         "type": "toggle",
         "label": "Allow FP16",
         "default": true,
-        "hint": "Lets frame generation and MAKO Scaler use half precision where the GPU supports it; off uses full precision (FP32). LS1 always uses FP32. Applies on the next launch."
+        "hint": "Lets frame generation and MAKO Scaler use half precision where the model and the GPU support it; off uses full precision (FP32). LS1 always uses FP32. Applies on the next launch."
       },
       {
         "key": "dll",
@@ -434,7 +491,7 @@
         "default": "",
         "max_length": 512,
         "placeholder": "automatic",
-        "hint": "Where Lossless.dll is. Leave empty to let MAKO find it. Frame generation and LS1 need it."
+        "hint": "Where Lossless.dll is. Leave empty to let MAKO find it. Only LSFG and LS1 need it; MAKO FG, MAKO Scaler and shaders don't. Applies on the next launch."
       }
     ],
     "launcher": [

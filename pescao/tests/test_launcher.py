@@ -12,7 +12,7 @@ class Launcher(unittest.TestCase):
         # As MAKO 4.0 wrote it: the keys added later get mako-launch's defaults.
         self.assertEqual(launcher.parse("version=1\nenable_zink=0\nforce_alsa_audio=0\n"), DEFAULTS)
         self.assertEqual(launcher.parse("# c\n version = 1 \nenable_zink=1\n"), {**DEFAULTS, "enable_zink": True})
-        # As mako-ui 4.6 writes it, and back the same.
+        # As mako-ui 4.6 and 5.0 write it, and back the same.
         text = "version=1\ndisable_hdr_exposure=0\ndisable_steam_overlay=1\nenable_zink=0\nforce_alsa_audio=1\n"
         settings = {"disable_hdr_exposure": False, "disable_steam_overlay": True, "enable_zink": False, "force_alsa_audio": True}
         self.assertEqual(launcher.parse(text), settings)

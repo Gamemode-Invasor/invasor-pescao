@@ -1,8 +1,9 @@
 """mako-launch's own settings (launcher.conf), in its strict format.
 
 Pure stdlib, no Invasor imports: tested on its own (tests/test_launcher.py). Ported from
-MAKO render-v4.6.0 engine/mako-common/src/configuration/launch.cpp. These apply to every
-game started through mako-launch, at its next start; they never go in conf.toml.
+MAKO render-v5.0.0 engine/mako-common/src/configuration/launch.cpp (the same as in 4.6.0).
+These apply to every game started through mako-launch, at its next start; they never go in
+conf.toml.
 
     version=1
     disable_hdr_exposure=0|1     (missing: 1)

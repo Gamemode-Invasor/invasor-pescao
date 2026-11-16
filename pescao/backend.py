@@ -79,9 +79,27 @@ def mako_problem(path):
     return None
 
 
+def _installed_version():
+    have = updates.installed()
+    return have and have["version"]
+
+
+def _old_mako(version):
+    """Why conf.toml can't be changed with this installed MAKO `version` (a 4.x: profiles are
+    written with MAKO 5's options and rules), or None. Not installed or an unknown version:
+    None, Pescao goes on as for MAKO 5."""
+    if not updates.older_major(version):
+        return None
+    return (f"MAKO {version} is from an older series: this Pescao needs MAKO {updates.SUPPORTED_MAJOR}.x. "
+            "Update MAKO in the Updates tab, or use Pescao 0.3.x.")
+
+
 def _change(fn):
     """Read, apply fn(data), write back (checked by MAKO itself when it can).
-    ValueError/KeyError from fn -> clean 400."""
+    ValueError/KeyError from fn -> clean 400. Never with an older MAKO series (_old_mako)."""
+    old = _old_mako(_installed_version())
+    if old:
+        raise ctx.Unavailable(old)
     path, data, mtime = _read()
     try:
         result = fn(data)
@@ -120,7 +138,8 @@ def profiles():
 
 
 def profile_get(name):
-    return ctx.forms["profile"].clean(_profile(name))
+    """The profile's options, as MAKO uses them (mako.shown: what Ultra performance sets)."""
+    return mako.shown(ctx.forms["profile"].clean(_profile(name)))
 
 
 def profile_set(name, key, value):
@@ -287,7 +306,7 @@ def _can_apply():
 def launch_option(name=None):
     """{line, found, can_apply}: the launch option for a profile, as mako-ui builds it,
     whether mako-launch is installed, and whether Steam lets Pescao set it on a game.
-    MAKO_PROFILE is what makes MAKO use the profile: MAKO 4 matches active_in against
+    MAKO_PROFILE is what makes MAKO use the profile: MAKO matches active_in against
     executables and process names, not Steam ids."""
     line = LAUNCH
     if name is not None:
@@ -363,11 +382,12 @@ def _latest():
 
 
 def compat():
-    """{installed, compat, tested}: whether the installed MAKO is the series Pescao was
-    tested with (no network)."""
-    have = updates.installed()
-    version = have and have["version"]
-    return {"installed": version, "compat": updates.compatibility(version), "tested": "%d.%d" % updates.TESTED}
+    """{installed, compat, tested, blocked}: whether the installed MAKO is the series Pescao
+    was tested with (no network), and why profiles can't be edited with it (an older series),
+    or None."""
+    version = _installed_version()
+    return {"installed": version, "compat": updates.compatibility(version), "tested": "%d.%d" % updates.TESTED,
+            "blocked": _old_mako(version)}
 
 
 def update_install():
